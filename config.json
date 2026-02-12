@@ -1,0 +1,15 @@
+{
+    "interface": "ens5",
+    "rules": [
+        {
+            "relay_port": 9999,
+            "target_ip": "161.248.136.126",
+            "target_port": 11786
+        },
+        {
+            "relay_port": 9998,
+            "target_ip": "161.248.136.126",
+            "target_port": 11782
+        }
+    ]
+}

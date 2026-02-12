@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -9,16 +10,42 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/vishvananda/netlink"
 )
 
+type Config struct {
+	Interface string `json:"interface"`
+	Rules     []struct {
+		RelayPort  uint16 `json:"relay_port"`
+		TargetIP   string `json:"target_ip"`
+		TargetPort uint16 `json:"target_port"`
+	} `json:"rules"`
+}
+
+// 确保 htons 实现正确
+func htons(i uint16) uint16 {
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b, i)
+	return *(*uint16)(unsafe.Pointer(&b[0]))
+}
+
 func main() {
-	ifaceName := "ens5" // 你的网卡名
-	// targetIPStr := "126.136.248.161"
-	targetIPStr := "161.248.136.126"
+
+	// 1. 读取配置文件
+	confFile, err := os.Open("config.json")
+	if err != nil {
+		log.Fatalf("Failed to open config file: %v", err)
+	}
+	defer confFile.Close()
+
+	var conf Config
+	if err := json.NewDecoder(confFile).Decode(&conf); err != nil {
+		log.Fatalf("Failed to decode config: %v", err)
+	}
 
 	// 1. 加载生成的 BPF 对象
 	objs := relayObjects{}
@@ -27,28 +54,31 @@ func main() {
 	}
 	defer objs.Close()
 
-	// 2. 探测网络信息 (MAC/IP/网关)
-	lIP, lMAC, nMAC, err := probeNetwork(ifaceName, targetIPStr)
-	if err != nil {
-		log.Fatalf("Network probe: %v", err)
-	}
+	for _, rule := range conf.Rules {
+		// 2. 探测网络信息 (MAC/IP/网关)
+		lIP, lMAC, nMAC, err := probeNetwork(conf.Interface, rule.TargetIP)
+		if err != nil {
+			fmt.Printf("⚠️ Skip rule %d: %v\n", rule.RelayPort, err)
+			continue
+		}
 
-	// 3. 使用生成的结构体填充 Map (注意：全部使用主机序存储)
-	cfg := relayRelayConfig{
-		RelayIp:    binary.BigEndian.Uint32(net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", byte(lIP), byte(lIP>>8), byte(lIP>>16), byte(lIP>>24))).To4()),
-		TargetIp:   binary.BigEndian.Uint32(net.ParseIP(targetIPStr).To4()),
-		RelayPort:  9999,
-		TargetPort: 11786,
-		RelayMac:   lMAC,
-		NextHopMac: nMAC,
-	}
-
-	if err := objs.ConfigMap.Update(uint32(0), &cfg, ebpf.UpdateAny); err != nil {
-		log.Fatalf("Update map failed: %v", err)
+		// 3. 使用生成的结构体填充 Map (注意：全部使用主机序存储)
+		cfg := relayRelayRule{
+			RelayIp:    binary.BigEndian.Uint32(net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", byte(lIP), byte(lIP>>8), byte(lIP>>16), byte(lIP>>24))).To4()),
+			TargetIp:   binary.BigEndian.Uint32(net.ParseIP(rule.TargetIP).To4()),
+			TargetPort: rule.TargetPort,
+			RelayMac:   lMAC,
+			NextHopMac: nMAC,
+		}
+		portKey := htons(rule.RelayPort)
+		if err := objs.ConfigMap.Update(portKey, &cfg, ebpf.UpdateAny); err != nil {
+			log.Fatalf("Update map failed: %v", err)
+		}
+		fmt.Printf("✅ Added: :%d -> %s:%d\n", rule.RelayPort, rule.TargetIP, rule.TargetPort)
 	}
 
 	// 4. 挂载 XDP 程序
-	iface, _ := net.InterfaceByName(ifaceName)
+	iface, err := net.InterfaceByName(conf.Interface)
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpRelayFunc,
 		Interface: iface.Index,
@@ -57,9 +87,7 @@ func main() {
 		log.Fatalf("Attach XDP: %v", err)
 	}
 	defer l.Close()
-
-	fmt.Printf("🚀 Relay Running: :9999 -> %s:11786\n", targetIPStr)
-	fmt.Printf("Local IP: %s, NextHop MAC: %x\n", net.IPv4(byte(lIP), byte(lIP>>8), byte(lIP>>16), byte(lIP>>24)), nMAC)
+	fmt.Printf("🚀 XDP program attached to interface %s\n", conf.Interface)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

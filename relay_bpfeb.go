@@ -13,19 +13,26 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type relayRelayConfig struct {
+type relayRelayRule struct {
 	_          structs.HostLayout
 	RelayIp    uint32
 	TargetIp   uint32
-	RelayPort  uint16
 	TargetPort uint16
 	RelayMac   [6]uint8
 	NextHopMac [6]uint8
 }
 
+type relaySessionKey struct {
+	_          structs.HostLayout
+	TargetIp   uint32
+	TargetPort uint16
+	ClientPort uint16
+}
+
 type relaySessionValue struct {
 	_         structs.HostLayout
 	ClientIp  uint32
+	RelayPort uint16
 	ClientMac [6]uint8
 }
 

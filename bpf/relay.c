@@ -9,36 +9,45 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-struct relay_config
+// 转发规则结构体
+struct relay_rule
 {
-    __u32 relay_ip;    // 主机字节序
-    __u32 target_ip;   // 主机字节序
-    __u16 relay_port;  // 主机字节序
-    __u16 target_port; // 主机字节序
+    __u32 relay_ip;    // 主机序
+    __u32 target_ip;   // 主机序
+    __u16 target_port; // 主机序
     unsigned char relay_mac[6];
     unsigned char next_hop_mac[6];
 } __attribute__((packed));
 
+// 配置表：Key 是网络序的入站端口 (tcph->dest)
 struct
 {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct relay_config);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u16);
+    __type(value, struct relay_rule);
 } config_map SEC(".maps");
 
-// 并发改进：使用客户端端口作为 Key
+// 会话键：利用目标信息和客户端端口锁定唯一连接
+struct session_key
+{
+    __u32 target_ip;   // 网络序
+    __u16 target_port; // 网络序
+    __u16 client_port; // 网络序
+} __attribute__((packed));
+
 struct session_value
 {
     __u32 client_ip;
+    __u16 relay_port; // 记录是从哪个中继端口进来的，用于回包还原
     unsigned char client_mac[6];
 } __attribute__((packed));
 
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65535); // 支持更多并发连接
-    __type(key, __u16);         // Key 是客户端的源端口
+    __uint(max_entries, 65535);
+    __type(key, struct session_key);
     __type(value, struct session_value);
 } session_map SEC(".maps");
 
@@ -75,77 +84,81 @@ int xdp_relay_func(struct xdp_md *ctx)
     if ((void *)(tcph + 1) > data_end)
         return XDP_PASS;
 
-    __u32 zero = 0;
-    struct relay_config *cfg = bpf_map_lookup_elem(&config_map, &zero);
-    if (!cfg)
-        return XDP_PASS;
+    // 1. 查找匹配的转发规则
+    __u16 dport = tcph->dest;
+    struct relay_rule *rule = bpf_map_lookup_elem(&config_map, &dport);
 
-    // 转换网络序
-    __u32 r_ip_net = bpf_htonl(cfg->relay_ip);
-    __u32 t_ip_net = bpf_htonl(cfg->target_ip);
-    __u16 r_port_net = bpf_htons(cfg->relay_port);
-    __u16 t_port_net = bpf_htons(cfg->target_port);
-
-    // --- 正向：Client -> Relay -> Target ---
-    if (tcph->dest == r_port_net)
+    if (rule)
     {
-        // 存储会话：以客户端源端口为 Key
-        __u16 c_port = tcph->source;
-        struct session_value sval = {.client_ip = iph->saddr};
-        __builtin_memcpy(sval.client_mac, eth->h_source, 6);
-        bpf_map_update_elem(&session_map, &c_port, &sval, BPF_ANY);
+        // 网络序准备
+        __u32 r_ip_net = bpf_htonl(rule->relay_ip);
+        __u32 t_ip_net = bpf_htonl(rule->target_ip);
+        __u16 t_port_net = bpf_htons(rule->target_port);
 
-        // 更新 TCP 校验和 (包含伪首部和端口)
+        // 2. 记录会话 (正向)
+        struct session_key skey = {
+            .target_ip = t_ip_net,
+            .target_port = t_port_net,
+            .client_port = tcph->source};
+        struct session_value sval = {
+            .client_ip = iph->saddr,
+            .relay_port = dport // 存入当前中继端口 (网络序)
+        };
+        __builtin_memcpy(sval.client_mac, eth->h_source, 6);
+        bpf_map_update_elem(&session_map, &skey, &sval, BPF_ANY);
+
+        // 3. 执行校验和更新 (DNAT + SNAT)
         update_csum(&tcph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(t_ip_net & 0xFFFF));
         update_csum(&tcph->check, (__u16)(iph->daddr >> 16), (__u16)(t_ip_net >> 16));
         update_csum(&tcph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
         update_csum(&tcph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
         update_csum(&tcph->check, tcph->dest, t_port_net);
 
-        // 更新 IP 校验和
         update_csum(&iph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(t_ip_net & 0xFFFF));
         update_csum(&iph->check, (__u16)(iph->daddr >> 16), (__u16)(t_ip_net >> 16));
         update_csum(&iph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
         update_csum(&iph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
 
+        // 4. 修改包字段
         iph->daddr = t_ip_net;
         iph->saddr = r_ip_net;
         tcph->dest = t_port_net;
-        __builtin_memcpy(eth->h_dest, cfg->next_hop_mac, 6);
-        __builtin_memcpy(eth->h_source, cfg->relay_mac, 6);
+        __builtin_memcpy(eth->h_dest, rule->next_hop_mac, 6);
+        __builtin_memcpy(eth->h_source, rule->relay_mac, 6);
 
         return XDP_TX;
     }
 
     // --- 反向：Target -> Relay -> Client ---
-    if (iph->saddr == t_ip_net && tcph->source == t_port_net)
+    struct session_key rskey = {
+        .target_ip = iph->saddr,
+        .target_port = tcph->source,
+        .client_port = tcph->dest};
+    struct session_value *rsval = bpf_map_lookup_elem(&session_map, &rskey);
+
+    if (rsval)
     {
-        __u16 c_port = tcph->dest; // 回包的目的端口就是原客户端的源端口
-        struct session_value *sval = bpf_map_lookup_elem(&session_map, &c_port);
-        if (sval)
-        {
-            // 【核心修复】反向 TCP 校验和更新
-            update_csum(&tcph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
-            update_csum(&tcph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
-            update_csum(&tcph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(sval->client_ip & 0xFFFF));
-            update_csum(&tcph->check, (__u16)(iph->daddr >> 16), (__u16)(sval->client_ip >> 16));
-            update_csum(&tcph->check, tcph->source, r_port_net);
+        __u32 r_ip_net = iph->daddr; // 中继 IP 就是当前目的 IP
 
-            // 反向 IP 校验和更新
-            update_csum(&iph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
-            update_csum(&iph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
-            update_csum(&iph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(sval->client_ip & 0xFFFF));
-            update_csum(&iph->check, (__u16)(iph->daddr >> 16), (__u16)(sval->client_ip >> 16));
+        update_csum(&tcph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
+        update_csum(&tcph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
+        update_csum(&tcph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(rsval->client_ip & 0xFFFF));
+        update_csum(&tcph->check, (__u16)(iph->daddr >> 16), (__u16)(rsval->client_ip >> 16));
+        update_csum(&tcph->check, tcph->source, rsval->relay_port);
 
-            iph->saddr = r_ip_net;
-            iph->daddr = sval->client_ip;
-            tcph->source = r_port_net;
-            __builtin_memcpy(eth->h_dest, sval->client_mac, 6);
-            __builtin_memcpy(eth->h_source, cfg->relay_mac, 6);
+        update_csum(&iph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
+        update_csum(&iph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
+        update_csum(&iph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(rsval->client_ip & 0xFFFF));
+        update_csum(&iph->check, (__u16)(iph->daddr >> 16), (__u16)(rsval->client_ip >> 16));
 
-            return XDP_TX;
-        }
+        iph->saddr = r_ip_net;
+        iph->daddr = rsval->client_ip;
+        tcph->source = rsval->relay_port;
+        __builtin_memcpy(eth->h_dest, rsval->client_mac, 6);
+        // 原路返回，源 MAC 是本机
+        return XDP_TX;
     }
+
     return XDP_PASS;
 }
 char _license[] SEC("license") = "GPL";
