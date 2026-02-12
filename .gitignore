@@ -1,0 +1,10 @@
+# 二进制程序
+baozap
+
+# eBPF 编译产物 (由 clang 生成的中间件)
+*.o
+!bpf/*.c
+
+# 开发工具产物
+.vscode/
+.idea/
