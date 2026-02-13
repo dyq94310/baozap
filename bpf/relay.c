@@ -12,9 +12,9 @@
 // 转发规则结构体
 struct relay_rule
 {
-    __u32 relay_ip;    // 主机序
-    __u32 target_ip;   // 主机序
-    __u16 target_port; // 主机序
+    __u32 relay_ip;    // 网络序
+    __u32 target_ip;   // 网络序
+    __u16 target_port; // 网络序
     unsigned char relay_mac[6];
     unsigned char next_hop_mac[6];
 } __attribute__((packed));
@@ -91,9 +91,9 @@ int xdp_relay_func(struct xdp_md *ctx)
     if (rule)
     {
         // 网络序准备
-        __u32 r_ip_net = bpf_htonl(rule->relay_ip);
-        __u32 t_ip_net = bpf_htonl(rule->target_ip);
-        __u16 t_port_net = bpf_htons(rule->target_port);
+        __u32 r_ip_net = rule->relay_ip;
+        __u32 t_ip_net = rule->target_ip;
+        __u16 t_port_net = rule->target_port;
 
         // 2. 记录会话 (正向)
         struct session_key skey = {

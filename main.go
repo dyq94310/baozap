@@ -26,7 +26,12 @@ type Config struct {
 	} `json:"rules"`
 }
 
-// 确保 htons 实现正确
+/*
+* 约定
+* go：负责主机序到BPF网络序的转换，负责繁琐工作
+* c：BPF：直接接收网络序,专注处理中继逻辑
+ */
+
 func htons(i uint16) uint16 {
 	b := make([]byte, 2)
 	binary.BigEndian.PutUint16(b, i)
@@ -64,9 +69,9 @@ func main() {
 
 		// 3. 使用生成的结构体填充 Map (注意：全部使用主机序存储)
 		cfg := relayRelayRule{
-			RelayIp:    binary.BigEndian.Uint32(net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", byte(lIP), byte(lIP>>8), byte(lIP>>16), byte(lIP>>24))).To4()),
-			TargetIp:   binary.BigEndian.Uint32(net.ParseIP(rule.TargetIP).To4()),
-			TargetPort: rule.TargetPort,
+			RelayIp:    lIP,
+			TargetIp:   binary.LittleEndian.Uint32(net.ParseIP(rule.TargetIP).To4()),
+			TargetPort: htons(rule.TargetPort),
 			RelayMac:   lMAC,
 			NextHopMac: nMAC,
 		}
