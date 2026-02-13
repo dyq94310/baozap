@@ -17,3 +17,11 @@ bpf_htonl,Host to Network Long,IP 地址 (32位) 转网络格式。
 
 
 本仓库已包含预编译的 eBPF 字节码（Go 文件）。若需修改内核态代码 relay.c，请确保本地已安装 clang 和 llvm，并运行 go generate 重新生成代码。
+
+## todo list
+
+- 实现UDP转发
+- 优化主机序和主机序的分层逻辑
+- 完善文档
+- 引入Cobra实现cmd cli
+- 进行benchmark对比
