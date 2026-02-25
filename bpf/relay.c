@@ -21,6 +21,16 @@
 #define IP_MF 0x2000     /* Flag: "More Fragments"	*/
 #define IP_OFFSET 0x1FFF /* "Fragment Offset" part	*/
 
+volatile const __u32 debug_enabled SEC(".data");
+
+// 定义一个宏，方便调用
+#define DEBUG_PRINTK(fmt, ...)              \
+    do                                      \
+    {                                       \
+        if (debug_enabled)                  \
+            bpf_printk(fmt, ##__VA_ARGS__); \
+    } while (0)
+
 struct relay_rule
 {
     __u32 relay_ip;    // raw (little-endian u32 from packet field)
@@ -205,9 +215,8 @@ int xdp_relay_func(struct xdp_md *ctx)
     {
         if (proto == IPPROTO_UDP)
         {
-            // bpf_printk 只支持最多 3 个参数，所以我们分次打印
-            bpf_printk("DEBUG: recv %s pkt: src %pI4 -> dst %pI4",
-                       proto == IPPROTO_TCP ? "TCP" : "UDP", &iph->saddr, &iph->daddr);
+            DEBUG_PRINTK("DEBUG: recv %s pkt: src %pI4 -> dst %pI4",
+                         proto == IPPROTO_TCP ? "TCP" : "UDP", &iph->saddr, &iph->daddr);
         }
     }
     else
@@ -218,7 +227,7 @@ int xdp_relay_func(struct xdp_md *ctx)
     // drop fragments (no完整L4)
     if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
     {
-        bpf_printk("DEBUG: Dropping fragmented packet from %pI4", &iph->saddr);
+        DEBUG_PRINTK("DEBUG: Dropping fragmented packet from %pI4", &iph->saddr);
         return XDP_PASS;
     }
 
@@ -242,13 +251,13 @@ int xdp_relay_func(struct xdp_md *ctx)
     // 2. 定位：收到原始包的日志
     if (proto == IPPROTO_UDP)
     {
-        bpf_printk("IN_UDP: %pI4:%d -> %pI4:%d (csum: 0x%x)",
-                   &iph->saddr, bpf_ntohs(sport), &iph->daddr, bpf_ntohs(dport), bpf_ntohs(*checkp));
+        DEBUG_PRINTK("IN_UDP: %pI4:%d -> %pI4:%d (csum: 0x%x)",
+                     &iph->saddr, bpf_ntohs(sport), &iph->daddr, bpf_ntohs(dport), bpf_ntohs(*checkp));
     }
     else
     {
-        bpf_printk("IN_TCP: %pI4:%d -> %pI4:%d",
-                   &iph->saddr, bpf_ntohs(sport), &iph->daddr, bpf_ntohs(dport));
+        DEBUG_PRINTK("IN_TCP: %pI4:%d -> %pI4:%d",
+                     &iph->saddr, bpf_ntohs(sport), &iph->daddr, bpf_ntohs(dport));
     }
 
     // ---------- 1) reverse first: Target -> Relay(snat_port) -> Client ----------
@@ -264,7 +273,7 @@ int xdp_relay_func(struct xdp_md *ctx)
     struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
     if (rval)
     {
-        bpf_printk("DEBUG: Found Rev Map! NAT to Client %pI4:%d", &rval->client_ip, bpf_ntohs(rval->client_port));
+        DEBUG_PRINTK("DEBUG: Found Rev Map! NAT to Client %pI4:%d", &rval->client_ip, bpf_ntohs(rval->client_port));
         __u32 old_saddr = iph->saddr; // target
         __u32 old_daddr = iph->daddr; // snat_ip
         __u32 new_saddr = old_daddr;  // relay ip
@@ -328,12 +337,12 @@ int xdp_relay_func(struct xdp_md *ctx)
         if (!rule)
         {
             // 打印 dport 的原始数值和转换后的数值
-            bpf_printk("DEBUG: Port Lookup Failed. Raw(Network): %d, Host: %d",
-                       dport, bpf_ntohs(dport));
+            DEBUG_PRINTK("DEBUG: Port Lookup Failed. Raw(Network): %d, Host: %d",
+                         dport, bpf_ntohs(dport));
             return XDP_PASS;
         }
 
-        bpf_printk("MATCH: Config rule found, creating new session");
+        DEBUG_PRINTK("MATCH: Config rule found, creating new session");
         // Build reverse reservation template
         struct rev_key new_rkey = {
             .snat_ip = rule->relay_ip,
@@ -380,7 +389,7 @@ int xdp_relay_func(struct xdp_md *ctx)
     }
     else
     {
-        bpf_printk("DEBUG: Found existing Fwd Map entry");
+        DEBUG_PRINTK("DEBUG: Found existing Fwd Map entry");
     }
 
     // Now apply forward NAT using fval

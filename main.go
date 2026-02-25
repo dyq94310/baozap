@@ -18,6 +18,7 @@ import (
 
 type Config struct {
 	Interface string `json:"interface"`
+	Debug     bool   `json:"debug"` // JSON 中不写则默认为 false
 	Rules     []struct {
 		RelayPort  uint16 `json:"relay_port"`
 		TargetIP   string `json:"target_ip"`
@@ -54,7 +55,28 @@ func main() {
 		log.Fatalf("Failed to decode config: %v", err)
 	}
 
-	objs := relayObjects{}
+    spec, err := loadRelay() // 函数名来自于你生成的源码
+    if err != nil {
+        log.Fatalf("failed to load bpf spec: %v", err)
+    }
+
+
+    if conf.Debug {
+        // 直接在 Spec 加载前设置初始值
+        // Set 会根据变量类型自动进行类型转换检查
+        if err := spec.Variables["debug_enabled"].Set(uint32(1)); err != nil {
+            log.Fatalf("failed to set debug_enabled: %v", err)
+        }
+    }
+
+    // 3. 将修改后的 Spec 加载到内核对象中
+    objs := relayObjects{}
+    if err := spec.LoadAndAssign(&objs, nil); err != nil {
+        log.Fatalf("failed to load objects: %v", err)
+    }
+
+    fmt.Printf("🛠  Debug Logging Enabled: %v\n", conf.Debug)
+
 	if err := loadRelayObjects(&objs, nil); err != nil {
 		log.Fatalf("Loading objects: %v", err)
 	}
