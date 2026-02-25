@@ -13,6 +13,29 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type relayFwdKey struct {
+	_           structs.HostLayout
+	Vip         uint32
+	ClientIp    uint32
+	ServicePort uint16
+	ClientPort  uint16
+	Proto       uint8
+	Pad1        uint8
+	Pad2        uint16
+}
+
+type relayFwdVal struct {
+	_          structs.HostLayout
+	SnatIp     uint32
+	TargetIp   uint32
+	TargetPort uint16
+	SnatPort   uint16
+	RelayMac   [6]uint8
+	NextHopMac [6]uint8
+	Pad        uint16
+	_          [2]byte
+}
+
 type relayRelayRule struct {
 	_          structs.HostLayout
 	RelayIp    uint32
@@ -22,18 +45,24 @@ type relayRelayRule struct {
 	NextHopMac [6]uint8
 }
 
-type relaySessionKey struct {
+type relayRevKey struct {
 	_          structs.HostLayout
+	SnatIp     uint32
 	TargetIp   uint32
 	TargetPort uint16
-	ClientPort uint16
+	SnatPort   uint16
+	Proto      uint8
+	Pad1       uint8
+	Pad2       uint16
 }
 
-type relaySessionValue struct {
-	_         structs.HostLayout
-	ClientIp  uint32
-	RelayPort uint16
-	ClientMac [6]uint8
+type relayRevVal struct {
+	_           structs.HostLayout
+	ClientIp    uint32
+	ClientPort  uint16
+	ServicePort uint16
+	ClientMac   [6]uint8
+	Pad         uint16
 }
 
 // loadRelay returns the embedded CollectionSpec for relay.
@@ -85,8 +114,9 @@ type relayProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type relayMapSpecs struct {
-	ConfigMap  *ebpf.MapSpec `ebpf:"config_map"`
-	SessionMap *ebpf.MapSpec `ebpf:"session_map"`
+	ConfigMap *ebpf.MapSpec `ebpf:"config_map"`
+	FwdMap    *ebpf.MapSpec `ebpf:"fwd_map"`
+	RevMap    *ebpf.MapSpec `ebpf:"rev_map"`
 }
 
 // relayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -115,14 +145,16 @@ func (o *relayObjects) Close() error {
 //
 // It can be passed to loadRelayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type relayMaps struct {
-	ConfigMap  *ebpf.Map `ebpf:"config_map"`
-	SessionMap *ebpf.Map `ebpf:"session_map"`
+	ConfigMap *ebpf.Map `ebpf:"config_map"`
+	FwdMap    *ebpf.Map `ebpf:"fwd_map"`
+	RevMap    *ebpf.Map `ebpf:"rev_map"`
 }
 
 func (m *relayMaps) Close() error {
 	return _RelayClose(
 		m.ConfigMap,
-		m.SessionMap,
+		m.FwdMap,
+		m.RevMap,
 	)
 }
 

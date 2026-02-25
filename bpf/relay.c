@@ -1,25 +1,36 @@
 // clang-format off
 //go:build ignore
 // clang-format on
+
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
 #include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// 转发规则结构体
+#define SNAT_PORT_BASE 49152u
+#define SNAT_PORT_MASK 0x3FFFu // 16384 ports: 49152..65535
+#define SNAT_TRIES 16          // fixed unroll tries
+
+/* IP flags. */
+#define IP_CE 0x8000     /* Flag: "Congestion"		*/
+#define IP_DF 0x4000     /* Flag: "Don't Fragment"	*/
+#define IP_MF 0x2000     /* Flag: "More Fragments"	*/
+#define IP_OFFSET 0x1FFF /* "Fragment Offset" part	*/
+
 struct relay_rule
 {
-    __u32 relay_ip;    // 网络序
-    __u32 target_ip;   // 网络序
-    __u16 target_port; // 网络序
+    __u32 relay_ip;    // raw (little-endian u32 from packet field)
+    __u32 target_ip;   // raw
+    __u16 target_port; // network order (raw like tcp/udp header field)
     unsigned char relay_mac[6];
     unsigned char next_hop_mac[6];
 } __attribute__((packed));
 
-// 配置表：Key 是网络序的入站端口 (tcph->dest)
+// Key: relay service port (network order raw)
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -28,29 +39,70 @@ struct
     __type(value, struct relay_rule);
 } config_map SEC(".maps");
 
-// 会话键：利用目标信息和客户端端口锁定唯一连接
-struct session_key
+// forward key: (vip, service_port, client_ip, client_port, proto)
+struct fwd_key
 {
-    __u32 target_ip;   // 网络序
-    __u16 target_port; // 网络序
-    __u16 client_port; // 网络序
-} __attribute__((packed));
+    __u32 vip;          // iph->daddr (raw)
+    __u32 client_ip;    // iph->saddr (raw)
+    __u16 service_port; // original dport (raw)
+    __u16 client_port;  // original sport (raw)
+    __u8 proto;         // TCP/UDP
+    __u8 pad1;
+    __u16 pad2;
+};
 
-struct session_value
+// forward value: resolved target + chosen snat_port + L2 data
+struct fwd_val
 {
-    __u32 client_ip;
-    __u16 relay_port; // 记录是从哪个中继端口进来的，用于回包还原
+    __u32 snat_ip;     // relay_ip (raw)
+    __u32 target_ip;   // raw
+    __u16 target_port; // raw
+    __u16 snat_port;   // raw (allocated)
+    unsigned char relay_mac[6];
+    unsigned char next_hop_mac[6];
+    __u16 pad;
+};
+
+// reverse key: (snat_ip, target_ip, target_port, snat_port, proto)
+struct rev_key
+{
+    __u32 snat_ip;     // iph->daddr on return path (raw)
+    __u32 target_ip;   // iph->saddr on return path (raw)
+    __u16 target_port; // sport on return path (raw)
+    __u16 snat_port;   // dport on return path (raw)
+    __u8 proto;
+    __u8 pad1;
+    __u16 pad2;
+};
+
+// reverse value: who is the client + what service_port to show to client
+struct rev_val
+{
+    __u32 client_ip;    // raw
+    __u16 client_port;  // raw
+    __u16 service_port; // raw (client sees src port as this)
     unsigned char client_mac[6];
-} __attribute__((packed));
+    __u16 pad;
+};
+
+// LRU: UDP 没有 close，必须 LRU
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, struct fwd_key);
+    __type(value, struct fwd_val);
+} fwd_map SEC(".maps");
 
 struct
 {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65535);
-    __type(key, struct session_key);
-    __type(value, struct session_value);
-} session_map SEC(".maps");
+    __type(key, struct rev_key);
+    __type(value, struct rev_val);
+} rev_map SEC(".maps");
 
+// RFC1624 incremental checksum update
 static __always_inline void update_csum(__u16 *csum, __u16 old_val, __u16 new_val)
 {
     __u32 sum = *csum;
@@ -62,6 +114,71 @@ static __always_inline void update_csum(__u16 *csum, __u16 old_val, __u16 new_va
     *csum = ~sum & 0xFFFF;
 }
 
+// UDP/IPv4: checksum=0 means "no checksum" => skip update.
+// If old != 0 and updated becomes 0, must set to 0xFFFF.
+static __always_inline void l4_csum_replace16(__u8 proto, __u16 *csum, __u16 old_val, __u16 new_val)
+{
+    if (proto == IPPROTO_UDP && *csum == 0)
+        return;
+    update_csum(csum, old_val, new_val);
+}
+
+static __always_inline void udp_csum_fixup_zero(__u8 proto, __u16 *csum, __u16 old_csum)
+{
+    if (proto == IPPROTO_UDP && old_csum != 0 && *csum == 0)
+        *csum = 0xFFFF;
+}
+
+static __always_inline int parse_l4(void *l4, void *data_end, __u8 proto,
+                                    __u16 **sportp, __u16 **dportp, __u16 **checkp,
+                                    struct tcphdr **tcph_out)
+{
+    if (proto == IPPROTO_TCP)
+    {
+        struct tcphdr *tcp = l4;
+        if ((void *)(tcp + 1) > data_end)
+            return -1;
+        *sportp = &tcp->source;
+        *dportp = &tcp->dest;
+        *checkp = &tcp->check;
+        if (tcph_out)
+            *tcph_out = tcp;
+        return 0;
+    }
+    if (proto == IPPROTO_UDP)
+    {
+        struct udphdr *udp = l4;
+        if ((void *)(udp + 1) > data_end)
+            return -1;
+        *sportp = &udp->source;
+        *dportp = &udp->dest;
+        *checkp = &udp->check;
+        if (tcph_out)
+            *tcph_out = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static __always_inline __u16 alloc_snat_port(__u32 seed, struct rev_key *rkey, struct rev_val *rval)
+{
+#pragma unroll
+    for (int i = 0; i < SNAT_TRIES; i++)
+    {
+        __u16 host_p = (__u16)(SNAT_PORT_BASE + ((seed + (__u32)i) & SNAT_PORT_MASK));
+        __u16 cand = bpf_htons(host_p); // store/write in raw network order
+
+        rkey->snat_port = cand;
+
+        // Try reserve this port by inserting reverse mapping
+        if (bpf_map_update_elem(&rev_map, rkey, rval, BPF_NOEXIST) == 0)
+        {
+            return cand; // success
+        }
+    }
+    return 0;
+}
+
 SEC("xdp")
 int xdp_relay_func(struct xdp_md *ctx)
 {
@@ -71,94 +188,243 @@ int xdp_relay_func(struct xdp_md *ctx)
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
+
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
 
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         return XDP_PASS;
-    if (iph->protocol != IPPROTO_TCP)
+
+    if (iph->version != 4)
         return XDP_PASS;
 
-    struct tcphdr *tcph = (void *)(iph + 1);
-    if ((void *)(tcph + 1) > data_end)
-        return XDP_PASS;
-
-    // 1. 查找匹配的转发规则
-    __u16 dport = tcph->dest;
-    struct relay_rule *rule = bpf_map_lookup_elem(&config_map, &dport);
-
-    if (rule)
+    // 1. 日志：捕获到 IP 包
+    __u8 proto = iph->protocol;
+    if (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
     {
-        // 网络序准备
-        __u32 r_ip_net = rule->relay_ip;
-        __u32 t_ip_net = rule->target_ip;
-        __u16 t_port_net = rule->target_port;
-
-        // 2. 记录会话 (正向)
-        struct session_key skey = {
-            .target_ip = t_ip_net,
-            .target_port = t_port_net,
-            .client_port = tcph->source};
-        struct session_value sval = {
-            .client_ip = iph->saddr,
-            .relay_port = dport // 存入当前中继端口 (网络序)
-        };
-        __builtin_memcpy(sval.client_mac, eth->h_source, 6);
-        bpf_map_update_elem(&session_map, &skey, &sval, BPF_ANY);
-
-        // 3. 执行校验和更新 (DNAT + SNAT)
-        update_csum(&tcph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(t_ip_net & 0xFFFF));
-        update_csum(&tcph->check, (__u16)(iph->daddr >> 16), (__u16)(t_ip_net >> 16));
-        update_csum(&tcph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
-        update_csum(&tcph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
-        update_csum(&tcph->check, tcph->dest, t_port_net);
-
-        update_csum(&iph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(t_ip_net & 0xFFFF));
-        update_csum(&iph->check, (__u16)(iph->daddr >> 16), (__u16)(t_ip_net >> 16));
-        update_csum(&iph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
-        update_csum(&iph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
-
-        // 4. 修改包字段
-        iph->daddr = t_ip_net;
-        iph->saddr = r_ip_net;
-        tcph->dest = t_port_net;
-        __builtin_memcpy(eth->h_dest, rule->next_hop_mac, 6);
-        __builtin_memcpy(eth->h_source, rule->relay_mac, 6);
-
-        return XDP_TX;
+        if (proto == IPPROTO_UDP)
+        {
+            // bpf_printk 只支持最多 3 个参数，所以我们分次打印
+            bpf_printk("DEBUG: recv %s pkt: src %pI4 -> dst %pI4",
+                       proto == IPPROTO_TCP ? "TCP" : "UDP", &iph->saddr, &iph->daddr);
+        }
+    }
+    else
+    {
+        return XDP_PASS;
     }
 
-    // --- 反向：Target -> Relay -> Client ---
-    struct session_key rskey = {
+    // drop fragments (no完整L4)
+    if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+    {
+        bpf_printk("DEBUG: Dropping fragmented packet from %pI4", &iph->saddr);
+        return XDP_PASS;
+    }
+
+    // support IP options
+    __u32 ihl_bytes = (__u32)iph->ihl * 4;
+    if (ihl_bytes < sizeof(*iph))
+        return XDP_PASS;
+
+    void *l4 = (void *)((char *)iph + ihl_bytes);
+    if ((void *)((char *)l4 + sizeof(struct udphdr)) > data_end)
+        return XDP_PASS;
+
+    __u16 *sportp = 0, *dportp = 0, *checkp = 0;
+    struct tcphdr *tcph = 0;
+    if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp, &tcph) < 0)
+        return XDP_PASS;
+
+    __u16 sport = *sportp;
+    __u16 dport = *dportp;
+
+    // 2. 定位：收到原始包的日志
+    if (proto == IPPROTO_UDP)
+    {
+        bpf_printk("IN_UDP: %pI4:%d -> %pI4:%d (csum: 0x%x)",
+                   &iph->saddr, bpf_ntohs(sport), &iph->daddr, bpf_ntohs(dport), bpf_ntohs(*checkp));
+    }
+    else
+    {
+        bpf_printk("IN_TCP: %pI4:%d -> %pI4:%d",
+                   &iph->saddr, bpf_ntohs(sport), &iph->daddr, bpf_ntohs(dport));
+    }
+
+    // ---------- 1) reverse first: Target -> Relay(snat_port) -> Client ----------
+    // return packet: src=target_ip:target_port, dst=snat_ip:snat_port
+    struct rev_key rkey = {
+        .snat_ip = iph->daddr,
         .target_ip = iph->saddr,
-        .target_port = tcph->source,
-        .client_port = tcph->dest};
-    struct session_value *rsval = bpf_map_lookup_elem(&session_map, &rskey);
+        .target_port = sport,
+        .snat_port = dport,
+        .proto = proto,
+    };
 
-    if (rsval)
+    struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
+    if (rval)
     {
-        __u32 r_ip_net = iph->daddr; // 中继 IP 就是当前目的 IP
+        bpf_printk("DEBUG: Found Rev Map! NAT to Client %pI4:%d", &rval->client_ip, bpf_ntohs(rval->client_port));
+        __u32 old_saddr = iph->saddr; // target
+        __u32 old_daddr = iph->daddr; // snat_ip
+        __u32 new_saddr = old_daddr;  // relay ip
+        __u32 new_daddr = rval->client_ip;
 
-        update_csum(&tcph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
-        update_csum(&tcph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
-        update_csum(&tcph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(rsval->client_ip & 0xFFFF));
-        update_csum(&tcph->check, (__u16)(iph->daddr >> 16), (__u16)(rsval->client_ip >> 16));
-        update_csum(&tcph->check, tcph->source, rsval->relay_port);
+        __u16 old_sport = sport;
+        __u16 old_dport = dport;
+        __u16 new_sport = rval->service_port;
+        __u16 new_dport = rval->client_port;
 
-        update_csum(&iph->check, (__u16)(iph->saddr & 0xFFFF), (__u16)(r_ip_net & 0xFFFF));
-        update_csum(&iph->check, (__u16)(iph->saddr >> 16), (__u16)(r_ip_net >> 16));
-        update_csum(&iph->check, (__u16)(iph->daddr & 0xFFFF), (__u16)(rsval->client_ip & 0xFFFF));
-        update_csum(&iph->check, (__u16)(iph->daddr >> 16), (__u16)(rsval->client_ip >> 16));
+        __u16 old_l4_csum = *checkp;
 
-        iph->saddr = r_ip_net;
-        iph->daddr = rsval->client_ip;
-        tcph->source = rsval->relay_port;
-        __builtin_memcpy(eth->h_dest, rsval->client_mac, 6);
-        // 原路返回，源 MAC 是本机
+        // L4 checksum updates: pseudo header + ports
+        l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+        l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+        l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+        l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+        l4_csum_replace16(proto, checkp, old_sport, new_sport);
+        l4_csum_replace16(proto, checkp, old_dport, new_dport);
+        udp_csum_fixup_zero(proto, checkp, old_l4_csum);
+
+        // IP header checksum updates (saddr/daddr)
+        update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+        update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+        update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+        update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+        // write back
+        iph->saddr = new_saddr;
+        iph->daddr = new_daddr;
+        *sportp = new_sport;
+        *dportp = new_dport;
+
+        // L2 rewrite: dst=client_mac, src=self_mac(=incoming dst mac)
+        unsigned char self_mac[6];
+        __builtin_memcpy(self_mac, eth->h_dest, 6);
+        __builtin_memcpy(eth->h_dest, rval->client_mac, 6);
+        __builtin_memcpy(eth->h_source, self_mac, 6);
+
         return XDP_TX;
     }
 
-    return XDP_PASS;
+    // ---------- 2) forward: Client -> Relay(service_port) -> Target ----------
+    // Try reuse existing mapping first (no config lookup on hit)
+    struct fwd_key fkey = {
+        .vip = iph->daddr,
+        .client_ip = iph->saddr,
+        .service_port = dport,
+        .client_port = sport,
+        .proto = proto,
+    };
+
+    struct fwd_val *fval = bpf_map_lookup_elem(&fwd_map, &fkey);
+    struct fwd_val new_fval;
+
+    if (!fval)
+    {
+        // Miss: need rule to create mapping
+        struct relay_rule *rule = bpf_map_lookup_elem(&config_map, &dport);
+        if (!rule)
+        {
+            // 打印 dport 的原始数值和转换后的数值
+            bpf_printk("DEBUG: Port Lookup Failed. Raw(Network): %d, Host: %d",
+                       dport, bpf_ntohs(dport));
+            return XDP_PASS;
+        }
+
+        bpf_printk("MATCH: Config rule found, creating new session");
+        // Build reverse reservation template
+        struct rev_key new_rkey = {
+            .snat_ip = rule->relay_ip,
+            .target_ip = rule->target_ip,
+            .target_port = rule->target_port,
+            .snat_port = 0, // to be allocated
+            .proto = proto,
+        };
+
+        struct rev_val new_rval = {
+            .client_ip = iph->saddr,
+            .client_port = sport,
+            .service_port = dport,
+        };
+        __builtin_memcpy(new_rval.client_mac, eth->h_source, 6);
+
+        // Allocate + reserve snat_port via rev_map insert
+        __u16 snat_port = alloc_snat_port(bpf_get_prandom_u32(), &new_rkey, &new_rval);
+        if (snat_port == 0)
+            return XDP_PASS; // no port available (or too many collisions)
+
+        // Build fwd_val (store resolved info + L2 data) so fast path doesn't touch config_map
+        new_fval.snat_ip = rule->relay_ip;
+        new_fval.target_ip = rule->target_ip;
+        new_fval.target_port = rule->target_port;
+        new_fval.snat_port = snat_port;
+        __builtin_memcpy(new_fval.relay_mac, rule->relay_mac, 6);
+        __builtin_memcpy(new_fval.next_hop_mac, rule->next_hop_mac, 6);
+
+        // Insert fwd_map; if lose race, cleanup rev reservation and use existing mapping
+        if (bpf_map_update_elem(&fwd_map, &fkey, &new_fval, BPF_NOEXIST) != 0)
+        {
+            // someone else created mapping for this flow, remove our reserved reverse key
+            bpf_map_delete_elem(&rev_map, &new_rkey);
+
+            fval = bpf_map_lookup_elem(&fwd_map, &fkey);
+            if (!fval)
+                return XDP_PASS; // extremely rare
+        }
+        else
+        {
+            fval = &new_fval;
+        }
+    }
+    else
+    {
+        bpf_printk("DEBUG: Found existing Fwd Map entry");
+    }
+
+    // Now apply forward NAT using fval
+    {
+        __u32 old_saddr = iph->saddr;    // client
+        __u32 old_daddr = iph->daddr;    // vip
+        __u32 new_saddr = fval->snat_ip; // relay ip
+        __u32 new_daddr = fval->target_ip;
+
+        __u16 old_sport = sport;
+        __u16 old_dport = dport;
+        __u16 new_sport = fval->snat_port;
+        __u16 new_dport = fval->target_port;
+
+        __u16 old_l4_csum = *checkp;
+
+        // L4 checksum updates: pseudo header + ports
+        l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+        l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+        l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+        l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+        l4_csum_replace16(proto, checkp, old_sport, new_sport);
+        l4_csum_replace16(proto, checkp, old_dport, new_dport);
+        udp_csum_fixup_zero(proto, checkp, old_l4_csum);
+
+        // IP header checksum updates
+        update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+        update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+        update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+        update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+        // write back
+        iph->saddr = new_saddr;
+        iph->daddr = new_daddr;
+        *sportp = new_sport;
+        *dportp = new_dport;
+
+        // L2 rewrite
+        __builtin_memcpy(eth->h_dest, fval->next_hop_mac, 6);
+        __builtin_memcpy(eth->h_source, fval->relay_mac, 6);
+
+        return XDP_TX;
+    }
 }
+
 char _license[] SEC("license") = "GPL";

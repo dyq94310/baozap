@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -32,15 +31,18 @@ type Config struct {
 * c：BPF：直接接收网络序,专注处理中继逻辑
  */
 
-func htons(i uint16) uint16 {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, i)
-	return *(*uint16)(unsafe.Pointer(&b[0]))
+
+func htons(v uint16) uint16 { return (v<<8)&0xff00 | (v>>8)&0x00ff }
+
+func ip4ToU32LE(ip net.IP) (uint32, error) {
+	v4 := ip.To4()
+	if v4 == nil {
+		return 0, fmt.Errorf("not ipv4: %v", ip)
+	}
+	return binary.LittleEndian.Uint32(v4), nil
 }
 
 func main() {
-
-	// 1. 读取配置文件
 	confFile, err := os.Open("config.json")
 	if err != nil {
 		log.Fatalf("Failed to open config file: %v", err)
@@ -52,7 +54,6 @@ func main() {
 		log.Fatalf("Failed to decode config: %v", err)
 	}
 
-	// 1. 加载生成的 BPF 对象
 	objs := relayObjects{}
 	if err := loadRelayObjects(&objs, nil); err != nil {
 		log.Fatalf("Loading objects: %v", err)
@@ -60,21 +61,26 @@ func main() {
 	defer objs.Close()
 
 	for _, rule := range conf.Rules {
-		// 2. 探测网络信息 (MAC/IP/网关)
 		lIP, lMAC, nMAC, err := probeNetwork(conf.Interface, rule.TargetIP)
 		if err != nil {
 			fmt.Printf("⚠️ Skip rule %d: %v\n", rule.RelayPort, err)
 			continue
 		}
 
-		// 3. 使用生成的结构体填充 Map (注意：全部使用主机序存储)
+		tip, err := ip4ToU32LE(net.ParseIP(rule.TargetIP))
+		if err != nil {
+			fmt.Printf("⚠️ Skip rule %d: invalid target ip: %v\n", rule.RelayPort, err)
+			continue
+		}
+
 		cfg := relayRelayRule{
-			RelayIp:    lIP,
-			TargetIp:   binary.LittleEndian.Uint32(net.ParseIP(rule.TargetIP).To4()),
-			TargetPort: htons(rule.TargetPort),
+			RelayIp:    lIP,                    // raw little-endian uint32
+			TargetIp:   tip,                    // raw little-endian uint32
+			TargetPort: htons(rule.TargetPort), // raw network-order uint16
 			RelayMac:   lMAC,
 			NextHopMac: nMAC,
 		}
+
 		portKey := htons(rule.RelayPort)
 		if err := objs.ConfigMap.Update(portKey, &cfg, ebpf.UpdateAny); err != nil {
 			log.Fatalf("Update map failed: %v", err)
@@ -82,8 +88,11 @@ func main() {
 		fmt.Printf("✅ Added: :%d -> %s:%d\n", rule.RelayPort, rule.TargetIP, rule.TargetPort)
 	}
 
-	// 4. 挂载 XDP 程序
 	iface, err := net.InterfaceByName(conf.Interface)
+	if err != nil {
+		log.Fatalf("InterfaceByName: %v", err)
+	}
+
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpRelayFunc,
 		Interface: iface.Index,
@@ -92,6 +101,7 @@ func main() {
 		log.Fatalf("Attach XDP: %v", err)
 	}
 	defer l.Close()
+
 	fmt.Printf("🚀 XDP program attached to interface %s\n", conf.Interface)
 
 	stop := make(chan os.Signal, 1)
@@ -100,30 +110,40 @@ func main() {
 }
 
 func probeNetwork(ifaceName, targetIPStr string) (uint32, [6]byte, [6]byte, error) {
-	link, _ := netlink.LinkByName(ifaceName)
-	addrs, _ := netlink.AddrList(link, netlink.FAMILY_V4)
+	nl, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		return 0, [6]byte{}, [6]byte{}, err
+	}
+
+	addrs, err := netlink.AddrList(nl, netlink.FAMILY_V4)
+	if err != nil || len(addrs) == 0 {
+		return 0, [6]byte{}, [6]byte{}, fmt.Errorf("no ipv4 addr on %s", ifaceName)
+	}
+
 	var lMAC, nMAC [6]byte
-	copy(lMAC[:], link.Attrs().HardwareAddr)
+	copy(lMAC[:], nl.Attrs().HardwareAddr)
+
 	localIP := binary.LittleEndian.Uint32(addrs[0].IP.To4())
 
-	routes, _ := netlink.RouteGet(net.ParseIP(targetIPStr))
-	if len(routes) == 0 {
-		return 0, lMAC, nMAC, fmt.Errorf("no route")
+	routes, err := netlink.RouteGet(net.ParseIP(targetIPStr))
+	if err != nil || len(routes) == 0 {
+		return 0, lMAC, nMAC, fmt.Errorf("no route to %s", targetIPStr)
 	}
+
 	gw := routes[0].Gw
 	if gw == nil {
 		gw = net.ParseIP(targetIPStr)
 	}
 
-	// 强制触发一次 ARP 学习，防止邻居表为空
-	exec.Command("ping", "-c", "1", "-W", "1", gw.String()).Run()
+	_ = exec.Command("ping", "-c", "1", "-W", "1", gw.String()).Run()
 
-	neighs, _ := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
+	neighs, _ := netlink.NeighList(nl.Attrs().Index, netlink.FAMILY_V4)
 	for _, n := range neighs {
-		if n.IP.Equal(gw) {
+		if n.IP != nil && n.IP.Equal(gw) && n.HardwareAddr != nil {
 			copy(nMAC[:], n.HardwareAddr)
 			return localIP, lMAC, nMAC, nil
 		}
 	}
+
 	return localIP, lMAC, lMAC, fmt.Errorf("ARP not found for gateway %s", gw)
 }
