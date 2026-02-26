@@ -1,0 +1,85 @@
+name: Build and Publish baozap
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - 'README.md'
+      - '.gitignore'
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 1. 检出源代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 设置 Go 环境并开启内置缓存
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true # 自动缓存 Go 模块和构建缓存
+
+      # 3. 安装 eBPF 编译工具链
+      - name: Install BPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
+
+      # 4. 缓存 eBPF 字节码产物 (.o 文件)
+      # 这样如果 C 代码没变，go generate 阶段可以显著缩短时间
+      - name: Cache BPF objects
+        uses: actions/cache@v4
+        with:
+          path: |
+            **/*.o
+            **/*_bpfel.go
+            **/*_bpfeb.go
+          key: ${{ runner.os }}-bpf-${{ hashFiles('**/*.c', '**/*.h') }}
+          restore-keys: |
+            ${{ runner.os }}-bpf-
+
+      # 5. 执行编译逻辑
+      - name: Generate eBPF and Build
+        run: |
+          go generate ./...
+          go build -v -o baozap main.go
+
+      # 6. 设置 Docker Buildx (支持 GitHub Actions 高级缓存)
+      - name: Set up Docker Buildx
+        uses: actions/setup-buildx-action@v3
+
+      # 7. 登录到 GHCR.io
+      - name: Log in to the Container registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 8. 构建并推送镜像，同时应用 Docker 层缓存
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # 使用 GitHub Actions 专用缓存后端 (type=gha)
+          # 这能极大加快后续 Docker build 的速度
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
