@@ -1,21 +1,24 @@
-name: Publish Docker Images 
+name: Publish Docker Images
 
 on:
   push:
     branches: [ "main", "dev" ]
     tags: [ "v*" ]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "手动指定构建标签"
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # 修改为你的镜像名称
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  # 阶段 1: 交叉编译 Go 二进制文件
   build_binary:
     name: Build binary
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: true
       matrix:
         include:
           - { arch: amd64, platform: "linux/amd64" }
@@ -23,6 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -31,13 +36,17 @@ jobs:
           cache: true
 
       - name: Install BPF dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
 
       - name: Build
         run: |
+          # 执行 eBPF 代码生成
           go generate ./...
-          # 使用静态编译，防止 alpine 环境缺少 glibc 依赖
-          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -v -trimpath -o baozap-${{ matrix.arch }} .
+          # 静态编译以适配 Alpine 镜像
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+          go build -v -trimpath -o baozap-${{ matrix.arch }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -46,16 +55,16 @@ jobs:
           path: baozap-${{ matrix.arch }}
           retention-days: 1
 
-  # 阶段 2: 为每个架构构建独立的 Docker 镜像并推送 Digest
   build_docker:
     name: Build Docker image
     runs-on: ubuntu-latest
     needs: build_binary
     strategy:
+      fail-fast: true
       matrix:
         include:
-          - { arch: amd64, platform: "linux/amd64" }
-          - { arch: arm64, platform: "linux/arm64" }
+          - { platform: "linux/amd64", arch: amd64 }
+          - { platform: "linux/arm64", arch: arm64 }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,9 +72,8 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v5
         with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
+          name: binary-${{ matrix.arch }}
+          path: .
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -73,19 +81,27 @@ jobs:
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
 
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile.binary
           platforms: ${{ matrix.platform }}
+          context: .
+          file: Dockerfile.binary
           build-args: ARCH=${{ matrix.arch }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          # 模仿 sing-box: 推送 digest 而非直接打 tag
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -98,9 +114,11 @@ jobs:
         with:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
-  # 阶段 3: 合并所有架构的 Digest 并发布最终 Tag
   merge:
+    name: Merge Manifest
     runs-on: ubuntu-latest
     needs: build_docker
     steps:
@@ -111,21 +129,20 @@ jobs:
           pattern: digests-*
           merge-multiple: true
 
-      - name: Setup Docker Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create manifest list and push
+        working-directory: /tmp/digests
         run: |
-          # 打印一下当前目录内容，方便在日志里排查
-          ls -R
-          # 动态确定 Tag
+          # 模仿 sing-box 的标签逻辑
           if [[ "${{ github.ref_name }}" == "main" ]]; then
             TAG="latest"
           elif [[ "${{ github.ref_name }}" == "dev" ]]; then
@@ -135,5 +152,5 @@ jobs:
           fi
           
           docker buildx imagetools create \
-              -t "ghcr.io/dyq94310/baozap:${TAG}" \
-              $(printf 'ghcr.io/dyq94310/baozap@sha256:%s ' *)
+            -t "${{ env.REGISTRY_IMAGE }}:${TAG}" \
+            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
