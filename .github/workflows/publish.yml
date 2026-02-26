@@ -1,105 +1,136 @@
-name: Build and Publish baozap
+name: Publish Docker Images (Sing-box Style)
 
 on:
   push:
-    # 监听 dev 和 main 分支的推送
-    branches:
-      - 'main'
-      - 'dev'
-    # 监听以 v 开头的版本标签 (如 v0.1.0)
-    tags:
-      - 'v*'
-  pull_request:
-    branches:
-      - 'main'
-      - 'dev'
+    branches: [ "main", "dev" ]
+    tags: [ "v*" ]
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  # 镜像名默认为：ghcr.io/dyq94310/baozap
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  # 阶段 1: 交叉编译 Go 二进制文件
+  build_binary:
+    name: Build binary
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write # 必须有写入 packages 的权限
-
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, platform: "linux/amd64" }
+          - { arch: arm64, platform: "linux/arm64" }
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 1. 设置 Go 环境并开启缓存
-      - name: Set up Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
           cache: true
 
-      # 2. 安装 eBPF 编译依赖工具链
       - name: Install BPF dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
 
-      # 3. 缓存 eBPF 编译产物 (.o 和生成的 .go 胶水代码)
-      - name: Cache BPF objects
-        uses: actions/cache@v4
+      - name: Build
+        run: |
+          go generate ./...
+          # 使用静态编译，防止 alpine 环境缺少 glibc 依赖
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -v -trimpath -o baozap-${{ matrix.arch }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          path: |
-            **/*.o
-            **/*_bpfel.go
-            **/*_bpfeb.go
-          key: ${{ runner.os }}-bpf-${{ hashFiles('**/*.c', '**/*.h') }}
-          restore-keys: |
-            ${{ runner.os }}-bpf-
+          name: binary-${{ matrix.arch }}
+          path: baozap-${{ matrix.arch }}
+          retention-days: 1
 
-      # 4. 执行代码生成和编译，确保符号引用正确
-      - name: Generate eBPF and Build
-        run: |
-          go generate -v ./...
-          # 使用 '.' 编译整个包，确保 loadRelay 等符号被识别
-          go build -v -o baozap .
+  # 阶段 2: 为每个架构构建独立的 Docker 镜像并推送 Digest
+  build_docker:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: build_binary
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, platform: "linux/amd64" }
+          - { arch: arm64, platform: "linux/arm64" }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # 5. 配置 Docker Buildx 以支持高级缓存
-      - name: Set up Docker Buildx
-        uses: actions/setup-buildx-action@v3
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: .
 
-      # 6. 登录到 GHCR.io
-      - name: Log in to the Container registry
-        if: github.event_name != 'pull_request'
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 7. 核心步骤：提取 Docker 标签元数据
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            # 如果是 dev 分支，镜像标签为 :dev
-            type=raw,value=dev,enable=${{ github.ref_name == 'dev' }}
-            # 如果是 main 分支，镜像标签为 :latest
-            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
-            # 始终生成一个基于 commit SHA 的标签
-            type=sha,prefix=
-            # 处理正式发布的语义化版本标签 (v*)
-            type=semver,pattern={{version}}
-
-      # 8. 构建并推送镜像
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
-          # 仅在非 PR 情况下推送镜像
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # 使用 gha 缓存后端加速构建
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          file: ./Dockerfile.binary
+          platforms: ${{ matrix.platform }}
+          build-args: ARCH=${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+
+  # 阶段 3: 合并所有架构的 Digest 并发布最终 Tag
+  merge:
+    runs-on: ubuntu-latest
+    needs: build_docker
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        run: |
+          # 动态确定 Tag
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            TAG="latest"
+          elif [[ "${{ github.ref_name }}" == "dev" ]]; then
+            TAG="dev"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          
+          docker buildx imagetools create \
+            -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}" \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' /tmp/digests/*)

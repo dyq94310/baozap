@@ -1,0 +1,8 @@
+FROM alpine:latest
+ARG ARCH
+# 拷贝对应架构的二进制文件
+COPY baozap-${ARCH} /usr/local/bin/baozap
+RUN chmod +x /usr/local/bin/baozap
+# 运行所需的目录
+WORKDIR /app
+ENTRYPOINT ["/usr/local/bin/baozap"]
