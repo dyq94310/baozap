@@ -2,15 +2,21 @@ name: Build and Publish baozap
 
 on:
   push:
-    branches: [ "main" ]
-    paths-ignore:
-      - 'README.md'
-      - '.gitignore'
+    # 监听 dev 和 main 分支的推送
+    branches:
+      - 'main'
+      - 'dev'
+    # 监听以 v 开头的版本标签 (如 v0.1.0)
+    tags:
+      - 'v*'
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - 'main'
+      - 'dev'
 
 env:
   REGISTRY: ghcr.io
+  # 镜像名默认为：ghcr.io/dyq94310/baozap
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
@@ -18,28 +24,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: write # 必须有写入 packages 的权限
 
     steps:
-      # 1. 检出源代码
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. 设置 Go 环境并开启内置缓存
+      # 1. 设置 Go 环境并开启缓存
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
-          cache: true # 自动缓存 Go 模块和构建缓存
+          cache: true
 
-      # 3. 安装 eBPF 编译工具链
+      # 2. 安装 eBPF 编译依赖工具链
       - name: Install BPF dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
 
-      # 4. 缓存 eBPF 字节码产物 (.o 文件)
-      # 这样如果 C 代码没变，go generate 阶段可以显著缩短时间
+      # 3. 缓存 eBPF 编译产物 (.o 和生成的 .go 胶水代码)
       - name: Cache BPF objects
         uses: actions/cache@v4
         with:
@@ -51,17 +55,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-bpf-
 
-      # 5. 执行编译逻辑
+      # 4. 执行代码生成和编译，确保符号引用正确
       - name: Generate eBPF and Build
         run: |
-          go generate ./...
-          go build -v -o baozap main.go
+          go generate -v ./...
+          # 使用 '.' 编译整个包，确保 loadRelay 等符号被识别
+          go build -v -o baozap .
 
-      # 6. 设置 Docker Buildx (支持 GitHub Actions 高级缓存)
+      # 5. 配置 Docker Buildx 以支持高级缓存
       - name: Set up Docker Buildx
         uses: actions/setup-buildx-action@v3
 
-      # 7. 登录到 GHCR.io
+      # 6. 登录到 GHCR.io
       - name: Log in to the Container registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -70,16 +75,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 8. 构建并推送镜像，同时应用 Docker 层缓存
+      # 7. 核心步骤：提取 Docker 标签元数据
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # 如果是 dev 分支，镜像标签为 :dev
+            type=raw,value=dev,enable=${{ github.ref_name == 'dev' }}
+            # 如果是 main 分支，镜像标签为 :latest
+            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+            # 始终生成一个基于 commit SHA 的标签
+            type=sha,prefix=
+            # 处理正式发布的语义化版本标签 (v*)
+            type=semver,pattern={{version}}
+
+      # 8. 构建并推送镜像
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
+          # 仅在非 PR 情况下推送镜像
           push: ${{ github.event_name != 'pull_request' }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          # 使用 GitHub Actions 专用缓存后端 (type=gha)
-          # 这能极大加快后续 Docker build 的速度
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 使用 gha 缓存后端加速构建
           cache-from: type=gha
           cache-to: type=gha,mode=max
