@@ -1,5 +1,5 @@
 {
-    "interface": "ens5",
+    "interface": "wlp2s0",
     "rules": [
         {
             "relay_port": 9999,
