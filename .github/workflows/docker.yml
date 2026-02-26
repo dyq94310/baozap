@@ -133,4 +133,4 @@ jobs:
           
           docker buildx imagetools create \
             -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}" \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' /tmp/digests/*)
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
