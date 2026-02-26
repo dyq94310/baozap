@@ -132,5 +132,5 @@ jobs:
           fi
           
           docker buildx imagetools create \
-            -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}" \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+                      -t "ghcr.io/dyq94310/baozap:${TAG}" \
+                      $(printf 'ghcr.io/dyq94310/baozap@sha256:%s ' *)
