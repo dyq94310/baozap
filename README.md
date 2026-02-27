@@ -175,3 +175,7 @@ GitHub Actions 工作流位于 `.github/workflows/docker.yml`，会构建 `amd64
 ```bash
 go generate ./...
 ```
+
+## License
+
+本项目采用 BSD 3-Clause License，详见 [LICENSE](./LICENSE)。
