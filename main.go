@@ -77,9 +77,6 @@ func main() {
 
     fmt.Printf("🛠  Debug Logging Enabled: %v\n", conf.Debug)
 
-	if err := loadRelayObjects(&objs, nil); err != nil {
-		log.Fatalf("Loading objects: %v", err)
-	}
 	defer objs.Close()
 
 	for _, rule := range conf.Rules {
