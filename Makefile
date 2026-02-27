@@ -1,13 +1,17 @@
 # 变量定义
 BINARY_NAME=baozap
 REMOTE_DEST=~/bao/
+GO_BIN ?= $(shell which go)
+GO_BIN := $(if $(GO_BIN),$(GO_BIN),/usr/local/go/bin/go)
+GOCACHE ?= /tmp/go-build-cache
+GOMODCACHE ?= $(HOME)/go/pkg/mod
 # 定义目标机器列表
 # TARGET_HOSTS=rich ix
 TARGET_HOSTS=rich
 # TARGET_HOSTS=ix
 
 
-.PHONY: all build stop deploy start clean
+.PHONY: all build test test-xdp stop deploy start clean
 
 # 默认执行流程
 all: build stop deploy start
@@ -18,6 +22,20 @@ build:
 	go generate ./...
 	@echo ">> Building Go binary..."
 	GOOS=linux GOARCH=amd64 go build -o $(BINARY_NAME) .
+
+# 常规测试（不依赖 root）
+test:
+	@echo ">> Running tests..."
+	mkdir -p $(GOCACHE)
+	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) $(GO_BIN) test ./...
+
+# XDP 集成测试（依赖 root/CAP_BPF）
+test-xdp:
+	@echo ">> Running XDP integration tests..."
+	mkdir -p $(GOCACHE)
+	sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \
+		GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) \
+		$(GO_BIN) test ./test -run TestXDPForwardAndReverseRewrite -v
 
 # 2. 停止远程服务
 stop:
