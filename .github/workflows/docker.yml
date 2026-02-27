@@ -2,15 +2,16 @@ name: Publish Docker Images
 
 on:
   push:
-    branches: [ "main", "dev" ]
-    tags: [ "v*" ]
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "手动指定构建标签"
+        description: "手动指定构建标签 (如: v0.1.0)"
+        required: false
+        type: string
 
 env:
-  # 修改为你的镜像名称
   REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
@@ -142,15 +143,20 @@ jobs:
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          # 模仿 sing-box 的标签逻辑
-          if [[ "${{ github.ref_name }}" == "main" ]]; then
-            TAG="latest"
-          elif [[ "${{ github.ref_name }}" == "dev" ]]; then
-            TAG="dev"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            RAW_TAG="${{ inputs.tag }}"
           else
-            TAG="${{ github.ref_name }}"
+            # 当通过 push tag 触发时，ref_name 就是 tag 的名字 (比如 v0.1.0)
+            RAW_TAG="${{ github.ref_name }}"
           fi
-          
+
+          # 2. 剥离开头的 'v' 字符 (v0.1.0 -> 0.1.0)
+          VERSION="${RAW_TAG#v}"
+
+          echo "检测到发版请求，准备构建版本: ${VERSION} 和 latest"
+
+          # 3. 极其清爽的打包命令，固定打上版本号和 latest 两个标签
           docker buildx imagetools create \
-            -t "${{ env.REGISTRY_IMAGE }}:${TAG}" \
+            -t "${{ env.REGISTRY_IMAGE }}:${VERSION}" \
+            -t "${{ env.REGISTRY_IMAGE }}:latest" \
             $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
