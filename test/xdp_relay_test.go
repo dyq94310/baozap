@@ -1,0 +1,252 @@
+//go:build linux
+
+package baozaptest
+
+import (
+	"bytes"
+	"encoding/binary"
+	"net"
+	"os"
+	"testing"
+
+	"github.com/cilium/ebpf"
+)
+
+const (
+	xdpTx       = 3
+	ipProtoUDP  = 17
+	ethHdrLen   = 14
+	ipv4HdrLen  = 20
+	udpHdrLen   = 8
+	ipv4EthType = 0x0800
+	snatMinPort = 49152
+	snatMaxPort = 65535
+)
+
+type relayObjects struct {
+	XdpRelayFunc *ebpf.Program `ebpf:"xdp_relay_func"`
+	ConfigMap    *ebpf.Map     `ebpf:"config_map"`
+}
+
+func (o *relayObjects) Close() error {
+	if o.XdpRelayFunc != nil {
+		_ = o.XdpRelayFunc.Close()
+	}
+	if o.ConfigMap != nil {
+		_ = o.ConfigMap.Close()
+	}
+	return nil
+}
+
+type udpTuple struct {
+	srcIP   string
+	dstIP   string
+	srcPort uint16
+	dstPort uint16
+}
+
+func TestXDPForwardAndReverseRewrite(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	relayIP := "10.10.0.1"
+	targetIP := "172.16.8.9"
+	clientIP := "192.168.50.100"
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	nextHopMAC := [6]byte{0x02, 0xde, 0xad, 0xbe, 0xef, 0x10}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	targetMAC := [6]byte{0x02, 0x66, 0x77, 0x88, 0x99, 0xaa}
+
+	const relayPort = uint16(9999)
+	const targetPort = uint16(11786)
+	const clientPort = uint16(54321)
+
+	if err := writeRelayRule(objs.ConfigMap, relayPort, relayIP, targetIP, targetPort, relayMAC, nextHopMAC); err != nil {
+		t.Fatalf("write relay rule: %v", err)
+	}
+
+	forwardIn := buildUDPPacket(
+		clientMAC,
+		relayMAC,
+		udpTuple{
+			srcIP:   clientIP,
+			dstIP:   relayIP,
+			srcPort: clientPort,
+			dstPort: relayPort,
+		},
+	)
+
+	ret, forwardOut, err := objs.XdpRelayFunc.Test(forwardIn)
+	if err != nil {
+		t.Fatalf("xdp forward test: %v", err)
+	}
+	if ret != xdpTx {
+		t.Fatalf("forward action = %d, want XDP_TX(%d)", ret, xdpTx)
+	}
+
+	gotDstMAC, gotSrcMAC, gotSrcIP, gotDstIP, gotSrcPort, gotDstPort := decodeUDPPacket(t, forwardOut)
+	if !bytes.Equal(gotDstMAC[:], nextHopMAC[:]) {
+		t.Fatalf("forward dst mac = %x, want %x", gotDstMAC, nextHopMAC)
+	}
+	if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
+		t.Fatalf("forward src mac = %x, want %x", gotSrcMAC, relayMAC)
+	}
+	if gotSrcIP.String() != relayIP {
+		t.Fatalf("forward src ip = %s, want %s", gotSrcIP, relayIP)
+	}
+	if gotDstIP.String() != targetIP {
+		t.Fatalf("forward dst ip = %s, want %s", gotDstIP, targetIP)
+	}
+	if gotDstPort != targetPort {
+		t.Fatalf("forward dst port = %d, want %d", gotDstPort, targetPort)
+	}
+	if gotSrcPort < snatMinPort || gotSrcPort > snatMaxPort {
+		t.Fatalf("snat port out of range: %d", gotSrcPort)
+	}
+
+	reverseIn := buildUDPPacket(
+		targetMAC,
+		relayMAC,
+		udpTuple{
+			srcIP:   targetIP,
+			dstIP:   relayIP,
+			srcPort: targetPort,
+			dstPort: gotSrcPort, // SNAT port from forward path
+		},
+	)
+
+	ret, reverseOut, err := objs.XdpRelayFunc.Test(reverseIn)
+	if err != nil {
+		t.Fatalf("xdp reverse test: %v", err)
+	}
+	if ret != xdpTx {
+		t.Fatalf("reverse action = %d, want XDP_TX(%d)", ret, xdpTx)
+	}
+
+	gotDstMAC, gotSrcMAC, gotSrcIP, gotDstIP, gotSrcPort, gotDstPort = decodeUDPPacket(t, reverseOut)
+	if !bytes.Equal(gotDstMAC[:], clientMAC[:]) {
+		t.Fatalf("reverse dst mac = %x, want %x", gotDstMAC, clientMAC)
+	}
+	if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
+		t.Fatalf("reverse src mac = %x, want %x", gotSrcMAC, relayMAC)
+	}
+	if gotSrcIP.String() != relayIP {
+		t.Fatalf("reverse src ip = %s, want %s", gotSrcIP, relayIP)
+	}
+	if gotDstIP.String() != clientIP {
+		t.Fatalf("reverse dst ip = %s, want %s", gotDstIP, clientIP)
+	}
+	if gotSrcPort != relayPort {
+		t.Fatalf("reverse src port = %d, want %d", gotSrcPort, relayPort)
+	}
+	if gotDstPort != clientPort {
+		t.Fatalf("reverse dst port = %d, want %d", gotDstPort, clientPort)
+	}
+}
+
+func mustLoadRelayObjectsForTest(t *testing.T) *relayObjects {
+	t.Helper()
+
+	spec, err := ebpf.LoadCollectionSpec("../relay_bpfel.o")
+	if err != nil {
+		t.Fatalf("load relay_bpfel.o: %v", err)
+	}
+
+	objs := &relayObjects{}
+	if err := spec.LoadAndAssign(objs, nil); err != nil {
+		t.Fatalf("load and assign bpf objects: %v", err)
+	}
+	return objs
+}
+
+func writeRelayRule(m *ebpf.Map, relayPort uint16, relayIP, targetIP string, targetPort uint16, relayMAC, nextHopMAC [6]byte) error {
+	key := make([]byte, 2)
+	binary.LittleEndian.PutUint16(key, htons(relayPort))
+
+	val := make([]byte, 22)
+	binary.LittleEndian.PutUint32(val[0:4], ip4ToU32LE(relayIP))
+	binary.LittleEndian.PutUint32(val[4:8], ip4ToU32LE(targetIP))
+	binary.LittleEndian.PutUint16(val[8:10], htons(targetPort))
+	copy(val[10:16], relayMAC[:])
+	copy(val[16:22], nextHopMAC[:])
+
+	return m.Update(key, val, ebpf.UpdateAny)
+}
+
+func ip4ToU32LE(ipStr string) uint32 {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(ip)
+}
+
+func htons(v uint16) uint16 {
+	return (v<<8)&0xff00 | (v>>8)&0x00ff
+}
+
+func buildUDPPacket(srcMAC, dstMAC [6]byte, tuple udpTuple) []byte {
+	b := make([]byte, ethHdrLen+ipv4HdrLen+udpHdrLen)
+
+	copy(b[0:6], dstMAC[:])
+	copy(b[6:12], srcMAC[:])
+	binary.BigEndian.PutUint16(b[12:14], ipv4EthType)
+
+	ipStart := ethHdrLen
+	b[ipStart+0] = 0x45
+	b[ipStart+1] = 0
+	binary.BigEndian.PutUint16(b[ipStart+2:ipStart+4], uint16(ipv4HdrLen+udpHdrLen))
+	binary.BigEndian.PutUint16(b[ipStart+4:ipStart+6], 0)
+	binary.BigEndian.PutUint16(b[ipStart+6:ipStart+8], 0)
+	b[ipStart+8] = 64
+	b[ipStart+9] = ipProtoUDP
+
+	srcIP := net.ParseIP(tuple.srcIP).To4()
+	dstIP := net.ParseIP(tuple.dstIP).To4()
+	copy(b[ipStart+12:ipStart+16], srcIP)
+	copy(b[ipStart+16:ipStart+20], dstIP)
+	binary.BigEndian.PutUint16(b[ipStart+10:ipStart+12], ipv4Checksum(b[ipStart:ipStart+ipv4HdrLen]))
+
+	udpStart := ethHdrLen + ipv4HdrLen
+	binary.BigEndian.PutUint16(b[udpStart+0:udpStart+2], tuple.srcPort)
+	binary.BigEndian.PutUint16(b[udpStart+2:udpStart+4], tuple.dstPort)
+	binary.BigEndian.PutUint16(b[udpStart+4:udpStart+6], udpHdrLen)
+	binary.BigEndian.PutUint16(b[udpStart+6:udpStart+8], 0)
+
+	return b
+}
+
+func decodeUDPPacket(t *testing.T, p []byte) (dstMAC, srcMAC [6]byte, srcIP, dstIP net.IP, srcPort, dstPort uint16) {
+	t.Helper()
+	minLen := ethHdrLen + ipv4HdrLen + udpHdrLen
+	if len(p) < minLen {
+		t.Fatalf("packet too short: %d", len(p))
+	}
+	copy(dstMAC[:], p[0:6])
+	copy(srcMAC[:], p[6:12])
+
+	srcIP = net.IPv4(p[26], p[27], p[28], p[29]).To4()
+	dstIP = net.IPv4(p[30], p[31], p[32], p[33]).To4()
+	srcPort = binary.BigEndian.Uint16(p[34:36])
+	dstPort = binary.BigEndian.Uint16(p[36:38])
+	return
+}
+
+func ipv4Checksum(hdr []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(hdr); i += 2 {
+		if i == 10 {
+			continue
+		}
+		sum += uint32(binary.BigEndian.Uint16(hdr[i : i+2]))
+	}
+	for (sum >> 16) != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
