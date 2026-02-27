@@ -2,18 +2,21 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 type Config struct {
@@ -111,16 +114,13 @@ func main() {
 		log.Fatalf("InterfaceByName: %v", err)
 	}
 
-	l, err := link.AttachXDP(link.XDPOptions{
-		Program:   objs.XdpRelayFunc,
-		Interface: iface.Index,
-	})
+	l, mode, err := attachXDPWithFallback(objs.XdpRelayFunc, iface.Index)
 	if err != nil {
 		log.Fatalf("Attach XDP: %v", err)
 	}
 	defer l.Close()
 
-	fmt.Printf("🚀 XDP program attached to interface %s\n", conf.Interface)
+	fmt.Printf("🚀 XDP program attached to interface %s (mode=%s)\n", conf.Interface, mode)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -179,4 +179,41 @@ func probeNetwork(ifaceName, targetIPStr string) (uint32, [6]byte, [6]byte, erro
 	}
 
 	return localIP, lMAC, lMAC, fmt.Errorf("ARP not found for gateway %s", gw)
+}
+
+func attachXDPWithFallback(prog *ebpf.Program, ifIndex int) (link.Link, string, error) {
+	tryModes := []struct {
+		name  string
+		flags link.XDPAttachFlags
+	}{
+		{name: "driver", flags: link.XDPDriverMode},
+		{name: "generic", flags: link.XDPGenericMode},
+	}
+
+	var errs []string
+	for i, m := range tryModes {
+		l, err := link.AttachXDP(link.XDPOptions{
+			Program:   prog,
+			Interface: ifIndex,
+			Flags:     m.flags,
+		})
+		if err == nil {
+			return l, m.name, nil
+		}
+
+		errs = append(errs, fmt.Sprintf("%s: %v", m.name, err))
+		if i == 0 && !isXDPModeUnsupported(err) {
+			return nil, "", err
+		}
+	}
+
+	return nil, "", fmt.Errorf("failed to attach xdp in all modes (%s)", strings.Join(errs, "; "))
+}
+
+func isXDPModeUnsupported(err error) bool {
+	if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EINVAL) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "operation not supported")
 }
