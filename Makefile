@@ -11,26 +11,29 @@ TARGET_HOSTS=rich
 # TARGET_HOSTS=ix
 
 
-.PHONY: all build test test-xdp stop deploy start clean
+.PHONY: all build test test-xdp gen-bpf stop deploy start clean
 
 # 默认执行流程
 all: build stop deploy start
 
-# 1. 编译构建 (包含 go generate 处理 XDP 字节码)
-build:
+# 生成 eBPF 相关代码与对象文件
+gen-bpf:
 	@echo ">> Generating XDP bytecodes..."
-	go generate ./...
+	$(GO_BIN) generate ./...
+
+# 1. 编译构建 (包含 go generate 处理 XDP 字节码)
+build: gen-bpf
 	@echo ">> Building Go binary..."
-	GOOS=linux GOARCH=amd64 go build -o $(BINARY_NAME) .
+	GOOS=linux GOARCH=amd64 $(GO_BIN) build -o $(BINARY_NAME) .
 
 # 常规测试（不依赖 root）
-test:
+test: gen-bpf
 	@echo ">> Running tests..."
 	mkdir -p $(GOCACHE)
 	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) $(GO_BIN) test ./...
 
 # XDP 集成测试（依赖 root/CAP_BPF）
-test-xdp:
+test-xdp: gen-bpf
 	@echo ">> Running XDP integration tests..."
 	mkdir -p $(GOCACHE)
 	sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \
