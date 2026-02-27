@@ -7,9 +7,9 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -55,27 +55,26 @@ func main() {
 		log.Fatalf("Failed to decode config: %v", err)
 	}
 
-    spec, err := loadRelay() // 函数名来自于你生成的源码
-    if err != nil {
-        log.Fatalf("failed to load bpf spec: %v", err)
-    }
+	spec, err := loadRelay() // 函数名来自于你生成的源码
+	if err != nil {
+		log.Fatalf("failed to load bpf spec: %v", err)
+	}
 
+	if conf.Debug {
+		// 直接在 Spec 加载前设置初始值
+		// Set 会根据变量类型自动进行类型转换检查
+		if err := spec.Variables["debug_enabled"].Set(uint32(1)); err != nil {
+			log.Fatalf("failed to set debug_enabled: %v", err)
+		}
+	}
 
-    if conf.Debug {
-        // 直接在 Spec 加载前设置初始值
-        // Set 会根据变量类型自动进行类型转换检查
-        if err := spec.Variables["debug_enabled"].Set(uint32(1)); err != nil {
-            log.Fatalf("failed to set debug_enabled: %v", err)
-        }
-    }
+	// 3. 将修改后的 Spec 加载到内核对象中
+	objs := relayObjects{}
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
+		log.Fatalf("failed to load objects: %v", err)
+	}
 
-    // 3. 将修改后的 Spec 加载到内核对象中
-    objs := relayObjects{}
-    if err := spec.LoadAndAssign(&objs, nil); err != nil {
-        log.Fatalf("failed to load objects: %v", err)
-    }
-
-    fmt.Printf("🛠  Debug Logging Enabled: %v\n", conf.Debug)
+	fmt.Printf("🛠  Debug Logging Enabled: %v\n", conf.Debug)
 
 	defer objs.Close()
 
@@ -142,7 +141,11 @@ func probeNetwork(ifaceName, targetIPStr string) (uint32, [6]byte, [6]byte, erro
 	var lMAC, nMAC [6]byte
 	copy(lMAC[:], nl.Attrs().HardwareAddr)
 
-	localIP := binary.LittleEndian.Uint32(addrs[0].IP.To4())
+	localIPv4 := addrs[0].IP.To4()
+	if localIPv4 == nil {
+		return 0, [6]byte{}, [6]byte{}, fmt.Errorf("invalid local ipv4 on %s", ifaceName)
+	}
+	localIP := binary.LittleEndian.Uint32(localIPv4)
 
 	routes, err := netlink.RouteGet(net.ParseIP(targetIPStr))
 	if err != nil || len(routes) == 0 {
@@ -153,15 +156,26 @@ func probeNetwork(ifaceName, targetIPStr string) (uint32, [6]byte, [6]byte, erro
 	if gw == nil {
 		gw = net.ParseIP(targetIPStr)
 	}
+	gw = gw.To4()
+	if gw == nil {
+		return 0, lMAC, nMAC, fmt.Errorf("invalid gateway ip for %s", targetIPStr)
+	}
 
-	_ = exec.Command("ping", "-c", "1", "-W", "1", gw.String()).Run()
-
-	neighs, _ := netlink.NeighList(nl.Attrs().Index, netlink.FAMILY_V4)
-	for _, n := range neighs {
-		if n.IP != nil && n.IP.Equal(gw) && n.HardwareAddr != nil {
-			copy(nMAC[:], n.HardwareAddr)
-			return localIP, lMAC, nMAC, nil
+	for i := 0; i < 3; i++ {
+		neighs, _ := netlink.NeighList(nl.Attrs().Index, netlink.FAMILY_V4)
+		for _, n := range neighs {
+			if n.IP != nil && n.IP.Equal(gw) && n.HardwareAddr != nil {
+				copy(nMAC[:], n.HardwareAddr)
+				return localIP, lMAC, nMAC, nil
+			}
 		}
+
+		// 使用 UDP 报文触发内核邻居解析，避免依赖外部 ping 命令。
+		if conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: localIPv4}, &net.UDPAddr{IP: gw, Port: 9}); err == nil {
+			_, _ = conn.Write([]byte{0})
+			_ = conn.Close()
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	return localIP, lMAC, lMAC, fmt.Errorf("ARP not found for gateway %s", gw)
