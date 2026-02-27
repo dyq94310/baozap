@@ -8,8 +8,8 @@ on:
       - dev
 
 jobs:
-  unit:
-    name: Go Test
+  test:
+    name: Go Test + XDP Integration
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,22 +20,14 @@ jobs:
         with:
           go-version: "1.26"
           cache: true
+
+      - name: Install BPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
 
       - name: Run tests
         run: make test
-
-  xdp:
-    name: XDP Integration Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
 
       - name: Run XDP test
         run: make test-xdp
