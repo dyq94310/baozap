@@ -66,13 +66,13 @@ jobs:
         run: |
           go generate ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
-          go build -v -trimpath -o baozap-linux-${{ matrix.arch }} .
+          go build -v -trimpath -o baozap-${{ matrix.arch }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.arch }}
-          path: baozap-linux-${{ matrix.arch }}
+          path: baozap-${{ matrix.arch }}
           retention-days: 1
 
   release:
@@ -99,16 +99,20 @@ jobs:
 
       - name: Package binaries
         run: |
-          chmod +x dist/baozap-linux-amd64 dist/baozap-linux-arm64
-          tar -C dist -czf dist/baozap-linux-amd64.tar.gz baozap-linux-amd64
-          tar -C dist -czf dist/baozap-linux-arm64.tar.gz baozap-linux-arm64
-          (cd dist && sha256sum baozap-linux-amd64.tar.gz baozap-linux-arm64.tar.gz > sha256sums.txt)
+          TAG="${{ steps.meta.outputs.tag }}"
+          for arch in amd64 arm64; do
+            chmod +x "dist/baozap-${arch}"
+            mkdir -p "dist/pkg-${arch}"
+            cp "dist/baozap-${arch}" "dist/pkg-${arch}/baozap"
+            tar -C "dist/pkg-${arch}" -czf "dist/baozap-${TAG}-${arch}.tar.gz" baozap
+          done
+          (cd dist && sha256sum baozap-"${TAG}"-amd64.tar.gz baozap-"${TAG}"-arm64.tar.gz > sha256sums.txt)
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           files: |
-            dist/baozap-linux-amd64.tar.gz
-            dist/baozap-linux-arm64.tar.gz
+            dist/baozap-${{ steps.meta.outputs.tag }}-amd64.tar.gz
+            dist/baozap-${{ steps.meta.outputs.tag }}-arm64.tar.gz
             dist/sha256sums.txt
