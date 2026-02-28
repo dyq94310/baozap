@@ -36,12 +36,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
-
-      - name: Run unit tests
+      - name: Run full test suite
         run: make test
-
-      - name: Run XDP integration test
-        run: make test-xdp
 
   build_binary:
     name: Build binary

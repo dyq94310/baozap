@@ -4,42 +4,59 @@
 
 ## 目录
 
-- `xdp_relay_test.go`: eBPF/XDP 集成测试，重点验证 `bpf/relay.c` 的转发与回包改写行为
+- `xdp_relay_test.go`: eBPF/XDP 集成测试（build tag: `xdp_integration`）
+- `../main_test.go`: Go 单元测试（不依赖 root）
 
 ## 覆盖内容
 
-`TestXDPForwardAndReverseRewrite` 主要覆盖：
+### Go 单元测试
 
-1. 正向转发路径：`Client -> Relay -> Target`
-2. 反向回包路径：`Target -> Relay -> Client`
-3. 关键字段改写正确性：
+覆盖：
+
+1. `ip4ToU32LE` 正常/异常输入
+2. `-v/--version` 参数识别
+3. XDP 挂载模式错误判定（`isXDPModeUnsupported`）
+
+### XDP 集成测试
+
+正向与反向主链路：
+
+1. `TestXDPForwardAndReverseRewrite`
+2. 关键字段改写正确性：
    - 二层：源/目的 MAC
    - 三层：源/目的 IPv4
    - 四层：源/目的 UDP 端口
-4. SNAT 端口分配范围（`49152..65535`）
+3. SNAT 端口分配范围（`49152..65535`）
+
+反例与异常场景：
+
+1. `TestXDPNoRulePass`：无规则命中时 `XDP_PASS`
+2. `TestXDPReverseWithoutSessionPass`：无会话反向包时 `XDP_PASS`
+3. `TestXDPFragmentPass`：分片包时 `XDP_PASS`
+4. `TestXDPUnsupportedProtocolPass`：非 TCP/UDP（如 ICMP）时 `XDP_PASS`
 
 ## 运行方式
 
 在仓库根目录执行：
 
 ```bash
-# Makefile 方式（推荐）
-make test
+# Go 单元测试（不依赖 root）
+make test-go
+
+# XDP 集成测试（依赖 root）
 make test-xdp
 
-# 运行全部测试包
-go test ./...
+# 一键完整测试（Go 单测 + XDP 集成）
+make test
 
-# 只运行 test 目录中的用例
-go test ./test -v
-
-# 指定运行 eBPF/XDP 测试（需要 root 或等效能力）
-sudo -E go test ./test -run TestXDPForwardAndReverseRewrite -v
+# 直接运行 XDP 测试集（需要 root 或等效能力）
+sudo -E go test ./test -tags xdp_integration -run TestXDP -v
 ```
 
 ## 注意事项
 
 - eBPF/XDP 测试依赖内核能力与权限，非 root 环境会自动跳过。
+- `xdp_relay_test.go` 使用 `xdp_integration` build tag，默认 `go test ./...` 不会执行。
 - 测试会加载仓库根目录下的 `relay_bpfel.o`，若修改了 `bpf/relay.c`，请先重新生成：
 
 ```bash

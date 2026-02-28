@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && xdp_integration
 
 package baozaptest
 
@@ -13,8 +13,10 @@ import (
 )
 
 const (
+	xdpPass     = 2
 	xdpTx       = 3
 	ipProtoUDP  = 17
+	ipProtoICMP = 1
 	ethHdrLen   = 14
 	ipv4HdrLen  = 20
 	udpHdrLen   = 8
@@ -149,6 +151,107 @@ func TestXDPForwardAndReverseRewrite(t *testing.T) {
 	}
 }
 
+func TestXDPNoRulePass(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	p := buildUDPPacket(clientMAC, relayMAC, udpTuple{
+		srcIP:   "192.168.1.10",
+		dstIP:   "10.0.0.1",
+		srcPort: 50000,
+		dstPort: 9999,
+	})
+
+	ret, _, err := objs.XdpRelayFunc.Test(p)
+	if err != nil {
+		t.Fatalf("xdp no-rule test: %v", err)
+	}
+	if ret != xdpPass {
+		t.Fatalf("action = %d, want XDP_PASS(%d)", ret, xdpPass)
+	}
+}
+
+func TestXDPReverseWithoutSessionPass(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	targetMAC := [6]byte{0x02, 0x66, 0x77, 0x88, 0x99, 0xaa}
+	p := buildUDPPacket(targetMAC, relayMAC, udpTuple{
+		srcIP:   "172.16.8.9",
+		dstIP:   "10.10.0.1",
+		srcPort: 11786,
+		dstPort: 60000,
+	})
+
+	ret, _, err := objs.XdpRelayFunc.Test(p)
+	if err != nil {
+		t.Fatalf("xdp reverse-without-session test: %v", err)
+	}
+	if ret != xdpPass {
+		t.Fatalf("action = %d, want XDP_PASS(%d)", ret, xdpPass)
+	}
+}
+
+func TestXDPFragmentPass(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	p := buildUDPPacket(clientMAC, relayMAC, udpTuple{
+		srcIP:   "192.168.1.10",
+		dstIP:   "10.0.0.1",
+		srcPort: 50000,
+		dstPort: 9999,
+	})
+	// Set MF flag to simulate fragmented IPv4 packet.
+	binary.BigEndian.PutUint16(p[ethHdrLen+6:ethHdrLen+8], 0x2000)
+
+	ret, _, err := objs.XdpRelayFunc.Test(p)
+	if err != nil {
+		t.Fatalf("xdp fragment test: %v", err)
+	}
+	if ret != xdpPass {
+		t.Fatalf("action = %d, want XDP_PASS(%d)", ret, xdpPass)
+	}
+}
+
+func TestXDPUnsupportedProtocolPass(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	p := buildIPv4Packet(clientMAC, relayMAC, ipProtoICMP, "192.168.1.10", "10.0.0.1")
+
+	ret, _, err := objs.XdpRelayFunc.Test(p)
+	if err != nil {
+		t.Fatalf("xdp unsupported-protocol test: %v", err)
+	}
+	if ret != xdpPass {
+		t.Fatalf("action = %d, want XDP_PASS(%d)", ret, xdpPass)
+	}
+}
+
 func mustLoadRelayObjectsForTest(t *testing.T) *relayObjects {
 	t.Helper()
 
@@ -218,6 +321,27 @@ func buildUDPPacket(srcMAC, dstMAC [6]byte, tuple udpTuple) []byte {
 	binary.BigEndian.PutUint16(b[udpStart+4:udpStart+6], udpHdrLen)
 	binary.BigEndian.PutUint16(b[udpStart+6:udpStart+8], 0)
 
+	return b
+}
+
+func buildIPv4Packet(srcMAC, dstMAC [6]byte, proto uint8, srcIP, dstIP string) []byte {
+	b := make([]byte, ethHdrLen+ipv4HdrLen)
+	copy(b[0:6], dstMAC[:])
+	copy(b[6:12], srcMAC[:])
+	binary.BigEndian.PutUint16(b[12:14], ipv4EthType)
+
+	ipStart := ethHdrLen
+	b[ipStart+0] = 0x45
+	b[ipStart+1] = 0
+	binary.BigEndian.PutUint16(b[ipStart+2:ipStart+4], uint16(ipv4HdrLen))
+	binary.BigEndian.PutUint16(b[ipStart+4:ipStart+6], 0)
+	binary.BigEndian.PutUint16(b[ipStart+6:ipStart+8], 0)
+	b[ipStart+8] = 64
+	b[ipStart+9] = proto
+
+	copy(b[ipStart+12:ipStart+16], net.ParseIP(srcIP).To4())
+	copy(b[ipStart+16:ipStart+20], net.ParseIP(dstIP).To4())
+	binary.BigEndian.PutUint16(b[ipStart+10:ipStart+12], ipv4Checksum(b[ipStart:ipStart+ipv4HdrLen]))
 	return b
 }
 
