@@ -6,7 +6,7 @@ GOCACHE ?= /tmp/go-build-cache
 GOMODCACHE ?= $(HOME)/go/pkg/mod
 
 
-.PHONY: all build test test-xdp gen-bpf clean
+.PHONY: all build test test-go test-xdp gen-bpf clean
 
 # 默认执行流程
 all: build
@@ -22,10 +22,13 @@ build: gen-bpf
 	GOOS=linux GOARCH=amd64 $(GO_BIN) build -o $(BINARY_NAME) .
 
 # 常规测试（不依赖 root）
-test: gen-bpf
+test-go: gen-bpf
 	@echo ">> Running tests..."
 	mkdir -p $(GOCACHE)
 	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) $(GO_BIN) test ./...
+
+# 完整测试（Go 单测 + XDP 集成测试）
+test: test-go test-xdp
 
 # XDP 集成测试（依赖 root/CAP_BPF）
 test-xdp: gen-bpf
@@ -33,7 +36,7 @@ test-xdp: gen-bpf
 	mkdir -p $(GOCACHE)
 	sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \
 		GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) \
-		$(GO_BIN) test ./test -run TestXDPForwardAndReverseRewrite -v
+		$(GO_BIN) test ./test -tags xdp_integration -run TestXDP -v
 
 # 清理本地二进制
 clean:

@@ -36,12 +36,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
-
-      - name: Run unit tests
+      - name: Run full test suite
         run: make test
-
-      - name: Run XDP integration test
-        run: make test-xdp
 
   build_binary:
     name: Build binary
@@ -72,11 +68,19 @@ jobs:
 
       - name: Build
         run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
+            VERSION="${{ inputs.tag }}"
+          elif [[ -n "${{ github.ref_name }}" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="dev"
+          fi
+
           # 执行 eBPF 代码生成
           go generate ./...
           # 静态编译以适配 Alpine 镜像
           CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
-          go build -v -trimpath -o baozap-${{ matrix.arch }} .
+          go build -v -trimpath -ldflags "-X main.version=${VERSION}" -o baozap-${{ matrix.arch }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

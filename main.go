@@ -29,6 +29,8 @@ type Config struct {
 	} `json:"rules"`
 }
 
+var version = "dev"
+
 /*
 * 约定
 * go：负责主机序到BPF网络序的转换，负责繁琐工作
@@ -47,6 +49,11 @@ func ip4ToU32LE(ip net.IP) (uint32, error) {
 }
 
 func main() {
+	if isVersionFlagRequested() {
+		fmt.Println(version)
+		return
+	}
+
 	confFile, err := os.Open("config.json")
 	if err != nil {
 		log.Fatalf("Failed to open config file: %v", err)
@@ -125,6 +132,15 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
+}
+
+func isVersionFlagRequested() bool {
+	for _, arg := range os.Args[1:] {
+		if arg == "-v" || arg == "--version" {
+			return true
+		}
+	}
+	return false
 }
 
 func probeNetwork(ifaceName, targetIPStr string) (uint32, [6]byte, [6]byte, error) {

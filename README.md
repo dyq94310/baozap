@@ -22,7 +22,8 @@
 
 - Linux（支持 eBPF/XDP）
 - root 权限（或等效能力）
-- Go 1.25+（源码运行时）
+
+使用已发布二进制包时，不需要本地 Go 环境。
 
 ## 配置示例
 
@@ -50,7 +51,29 @@
 - `rules[].target_ip`: 目标 IPv4
 - `rules[].target_port`: 目标端口
 
-## 本地运行
+## 二进制部署（推荐）
+
+每个版本会在 GitHub Release 提供二进制包（Assets）：
+
+- `baozap-<tag>-amd64.tar.gz`
+- `baozap-<tag>-arm64.tar.gz`
+- `sha256sums.txt`
+
+示例（以 `v0.3.3` 和 `amd64` 为例）：
+
+```bash
+curl -LO https://github.com/dyq94310/baozap/releases/download/v0.3.3/baozap-v0.3.3-amd64.tar.gz
+tar -xzf baozap-v0.3.3-amd64.tar.gz
+sudo ./baozap
+```
+
+查看版本：
+
+```bash
+./baozap -v
+```
+
+## 源码运行
 
 ```bash
 make build
