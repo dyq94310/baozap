@@ -32,17 +32,18 @@ type relayFwdVal struct {
 	SnatPort   uint16
 	RelayMac   [6]uint8
 	NextHopMac [6]uint8
-	Pad        uint16
-	_          [2]byte
+	TxIfindex  uint32
 }
 
 type relayRelayRule struct {
-	_          structs.HostLayout
-	RelayIp    uint32
-	TargetIp   uint32
-	TargetPort uint16
-	RelayMac   [6]uint8
-	NextHopMac [6]uint8
+	_            structs.HostLayout
+	RelayIp      uint32
+	TargetIp     uint32
+	TargetPort   uint16
+	RelayMac     [6]uint8
+	NextHopMac   [6]uint8
+	RelayIfindex uint32
+	TxIfindex    uint32
 }
 
 type relayRevKey struct {
@@ -57,12 +58,14 @@ type relayRevKey struct {
 }
 
 type relayRevVal struct {
-	_           structs.HostLayout
-	ClientIp    uint32
-	ClientPort  uint16
-	ServicePort uint16
-	ClientMac   [6]uint8
-	Pad         uint16
+	_             structs.HostLayout
+	ClientIp      uint32
+	ClientPort    uint16
+	ServicePort   uint16
+	Vip           uint32
+	ClientMac     [6]uint8
+	RelayMac      [6]uint8
+	ClientIfindex uint32
 }
 
 // loadRelay returns the embedded CollectionSpec for relay.
@@ -117,6 +120,7 @@ type relayMapSpecs struct {
 	ConfigMap *ebpf.MapSpec `ebpf:"config_map"`
 	FwdMap    *ebpf.MapSpec `ebpf:"fwd_map"`
 	RevMap    *ebpf.MapSpec `ebpf:"rev_map"`
+	StatsMap  *ebpf.MapSpec `ebpf:"stats_map"`
 }
 
 // relayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -149,6 +153,7 @@ type relayMaps struct {
 	ConfigMap *ebpf.Map `ebpf:"config_map"`
 	FwdMap    *ebpf.Map `ebpf:"fwd_map"`
 	RevMap    *ebpf.Map `ebpf:"rev_map"`
+	StatsMap  *ebpf.Map `ebpf:"stats_map"`
 }
 
 func (m *relayMaps) Close() error {
@@ -156,6 +161,7 @@ func (m *relayMaps) Close() error {
 		m.ConfigMap,
 		m.FwdMap,
 		m.RevMap,
+		m.StatsMap,
 	)
 }
 

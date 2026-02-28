@@ -68,7 +68,7 @@ func TestXDPForwardAndReverseRewrite(t *testing.T) {
 	const targetPort = uint16(11786)
 	const clientPort = uint16(54321)
 
-	if err := writeRelayRule(objs.ConfigMap, relayPort, relayIP, targetIP, targetPort, relayMAC, nextHopMAC); err != nil {
+	if err := writeRelayRule(objs.ConfigMap, relayPort, relayIP, targetIP, targetPort, relayMAC, nextHopMAC, 0, 0); err != nil {
 		t.Fatalf("write relay rule: %v", err)
 	}
 
@@ -267,16 +267,18 @@ func mustLoadRelayObjectsForTest(t *testing.T) *relayObjects {
 	return objs
 }
 
-func writeRelayRule(m *ebpf.Map, relayPort uint16, relayIP, targetIP string, targetPort uint16, relayMAC, nextHopMAC [6]byte) error {
+func writeRelayRule(m *ebpf.Map, relayPort uint16, relayIP, targetIP string, targetPort uint16, relayMAC, nextHopMAC [6]byte, relayIfindex, txIfindex uint32) error {
 	key := make([]byte, 2)
 	binary.LittleEndian.PutUint16(key, htons(relayPort))
 
-	val := make([]byte, 22)
+	val := make([]byte, 30)
 	binary.LittleEndian.PutUint32(val[0:4], ip4ToU32LE(relayIP))
 	binary.LittleEndian.PutUint32(val[4:8], ip4ToU32LE(targetIP))
 	binary.LittleEndian.PutUint16(val[8:10], htons(targetPort))
 	copy(val[10:16], relayMAC[:])
 	copy(val[16:22], nextHopMAC[:])
+	binary.LittleEndian.PutUint32(val[22:26], relayIfindex)
+	binary.LittleEndian.PutUint32(val[26:30], txIfindex)
 
 	return m.Update(key, val, ebpf.UpdateAny)
 }
