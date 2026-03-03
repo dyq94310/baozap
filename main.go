@@ -2,9 +2,10 @@ package main
 
 import (
 	"encoding/binary"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -20,23 +21,41 @@ import (
 )
 
 type Config struct {
-	Interface string `json:"interface"`
-	Debug     bool   `json:"debug"` // JSON 中不写则默认为 false
+	Interface string `json:"interface"`        // legacy default interface
+	Mode      string `json:"mode"`             // "xdp" (default) or "tc"
+	Debug     bool   `json:"debug"`            // JSON 中不写则默认为 false
 	Rules     []struct {
-		RelayPort  uint16 `json:"relay_port"`
-		TargetIP   string `json:"target_ip"`
-		TargetPort uint16 `json:"target_port"`
+		RelayInterface  string `json:"relay_interface"`
+		TargetInterface string `json:"target_interface"`
+		RelayPort       uint16 `json:"relay_port"`
+		TargetIP        string `json:"target_ip"`
+		TargetPort      uint16 `json:"target_port"`
 	} `json:"rules"`
 }
 
 var version = "dev"
+
+const (
+	statForwardHit = iota
+	statReverseHit
+	statRedirect
+	statPass
+	statDrop
+)
+
+var statNames = []string{
+	"forward_hit",
+	"reverse_hit",
+	"redirect",
+	"pass",
+	"drop",
+}
 
 /*
 * 约定
 * go：负责主机序到BPF网络序的转换，负责繁琐工作
 * c：BPF：直接接收网络序,专注处理中继逻辑
  */
-
 
 func htons(v uint16) uint16 { return (v<<8)&0xff00 | (v>>8)&0x00ff }
 
@@ -87,9 +106,24 @@ func main() {
 	fmt.Printf("🛠  Debug Logging Enabled: %v\n", conf.Debug)
 
 	defer objs.Close()
+	defer dumpStatsMap(objs.StatsMap)
 
+	attachIfs := map[int]string{}
 	for _, rule := range conf.Rules {
-		lIP, lMAC, nMAC, err := probeNetwork(conf.Interface, rule.TargetIP)
+		relayIf := rule.RelayInterface
+		if relayIf == "" {
+			relayIf = conf.Interface
+		}
+		targetIf := rule.TargetInterface
+		if targetIf == "" {
+			targetIf = relayIf
+		}
+		if relayIf == "" || targetIf == "" {
+			fmt.Printf("⚠️ Skip rule %d: relay_interface/target_interface is required\n", rule.RelayPort)
+			continue
+		}
+
+		snatIP, outMAC, nextHopMAC, relayIfindex, txIfindex, err := probeNetwork(relayIf, targetIf, rule.TargetIP)
 		if err != nil {
 			fmt.Printf("⚠️ Skip rule %d: %v\n", rule.RelayPort, err)
 			continue
@@ -101,33 +135,68 @@ func main() {
 			continue
 		}
 
-		cfg := relayRelayRule{
-			RelayIp:    lIP,                    // raw little-endian uint32
-			TargetIp:   tip,                    // raw little-endian uint32
-			TargetPort: htons(rule.TargetPort), // raw network-order uint16
-			RelayMac:   lMAC,
-			NextHopMac: nMAC,
-		}
+		val := buildRelayRuleValue(
+			snatIP,
+			tip,
+			htons(rule.TargetPort), // raw network-order uint16
+			outMAC,
+			nextHopMAC,
+			relayIfindex,
+			txIfindex,
+		)
 
 		portKey := htons(rule.RelayPort)
-		if err := objs.ConfigMap.Update(portKey, &cfg, ebpf.UpdateAny); err != nil {
+		if err := objs.ConfigMap.Update(portKey, val, ebpf.UpdateAny); err != nil {
 			log.Fatalf("Update map failed: %v", err)
 		}
-		fmt.Printf("✅ Added: :%d -> %s:%d\n", rule.RelayPort, rule.TargetIP, rule.TargetPort)
+		fmt.Printf(
+			"✅ Added: %s/%s :%d -> %s:%d (relay_ifindex=%d tx_ifindex=%d out_mac=%s next_hop=%s)\n",
+			relayIf, targetIf, rule.RelayPort, rule.TargetIP, rule.TargetPort,
+			relayIfindex, txIfindex,
+			net.HardwareAddr(outMAC[:]).String(),
+			net.HardwareAddr(nextHopMAC[:]).String(),
+		)
+
+		if lnk, err := netlink.LinkByName(relayIf); err == nil && lnk.Attrs() != nil {
+			attachIfs[lnk.Attrs().Index] = relayIf
+		}
+		if lnk, err := netlink.LinkByName(targetIf); err == nil && lnk.Attrs() != nil {
+			attachIfs[lnk.Attrs().Index] = targetIf
+		}
 	}
 
-	iface, err := net.InterfaceByName(conf.Interface)
-	if err != nil {
-		log.Fatalf("InterfaceByName: %v", err)
+	if len(attachIfs) == 0 {
+		log.Fatalf("no valid rules loaded; nothing to attach")
 	}
 
-	l, mode, err := attachXDPWithFallback(objs.XdpRelayFunc, iface.Index)
-	if err != nil {
-		log.Fatalf("Attach XDP: %v", err)
+	mode := strings.ToLower(conf.Mode)
+	if mode == "" {
+		mode = "xdp"
 	}
-	defer l.Close()
 
-	fmt.Printf("🚀 XDP program attached to interface %s (mode=%s)\n", conf.Interface, mode)
+	var links []io.Closer
+	for ifidx, ifname := range attachIfs {
+		if mode == "tc" {
+			l, err := attachTCIngress(objs.TcRelayFunc, ifidx, ifname)
+			if err != nil {
+				log.Fatalf("Attach TC on %s(%d): %v", ifname, ifidx, err)
+			}
+			links = append(links, l)
+			fmt.Printf("🚀 TC program attached to interface %s (hook=clsact/ingress)\n", ifname)
+		} else {
+			l, xdpMode, err := attachXDPWithFallback(objs.XdpRelayFunc, ifidx, ifname)
+			if err != nil {
+				log.Fatalf("Attach XDP on %s(%d): %v", ifname, ifidx, err)
+			}
+			links = append(links, l)
+			fmt.Printf("🚀 XDP program attached to interface %s (mode=%s)\n", ifname, xdpMode)
+		}
+	}
+	defer func() {
+		for _, l := range links {
+			_ = l.Close()
+		}
+	}()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -143,29 +212,54 @@ func isVersionFlagRequested() bool {
 	return false
 }
 
-func probeNetwork(ifaceName, targetIPStr string) (uint32, [6]byte, [6]byte, error) {
-	nl, err := netlink.LinkByName(ifaceName)
+func probeNetwork(relayIfaceName, targetIfaceName, targetIPStr string) (uint32, [6]byte, [6]byte, int, int, error) {
+	relayLink, err := netlink.LinkByName(relayIfaceName)
 	if err != nil {
-		return 0, [6]byte{}, [6]byte{}, err
+		return 0, [6]byte{}, [6]byte{}, 0, 0, err
+	}
+	targetLink, err := netlink.LinkByName(targetIfaceName)
+	if err != nil {
+		return 0, [6]byte{}, [6]byte{}, 0, 0, err
+	}
+	if relayLink.Attrs() == nil || targetLink.Attrs() == nil {
+		return 0, [6]byte{}, [6]byte{}, 0, 0, fmt.Errorf("invalid interface attrs for %s/%s", relayIfaceName, targetIfaceName)
 	}
 
-	addrs, err := netlink.AddrList(nl, netlink.FAMILY_V4)
-	if err != nil || len(addrs) == 0 {
-		return 0, [6]byte{}, [6]byte{}, fmt.Errorf("no ipv4 addr on %s", ifaceName)
+	targetAddrs, err := netlink.AddrList(targetLink, netlink.FAMILY_V4)
+	if err != nil || len(targetAddrs) == 0 {
+		return 0, [6]byte{}, [6]byte{}, 0, 0, fmt.Errorf("no ipv4 addr on target interface %s", targetIfaceName)
 	}
 
-	var lMAC, nMAC [6]byte
-	copy(lMAC[:], nl.Attrs().HardwareAddr)
+	var outMAC, nextHopMAC [6]byte
+	copy(outMAC[:], targetLink.Attrs().HardwareAddr)
 
-	localIPv4 := addrs[0].IP.To4()
-	if localIPv4 == nil {
-		return 0, [6]byte{}, [6]byte{}, fmt.Errorf("invalid local ipv4 on %s", ifaceName)
+	snatIPv4 := targetAddrs[0].IP.To4()
+	if snatIPv4 == nil {
+		return 0, [6]byte{}, [6]byte{}, 0, 0, fmt.Errorf("invalid local ipv4 on target interface %s", targetIfaceName)
 	}
-	localIP := binary.LittleEndian.Uint32(localIPv4)
+	snatIP := binary.LittleEndian.Uint32(snatIPv4)
+	relayIfindex := relayLink.Attrs().Index
+	txIfindex := targetLink.Attrs().Index
 
 	routes, err := netlink.RouteGet(net.ParseIP(targetIPStr))
 	if err != nil || len(routes) == 0 {
-		return 0, lMAC, nMAC, fmt.Errorf("no route to %s", targetIPStr)
+		return 0, outMAC, nextHopMAC, relayIfindex, txIfindex, fmt.Errorf("no route to %s", targetIPStr)
+	}
+	if routes[0].LinkIndex != 0 {
+		txIfindex = routes[0].LinkIndex
+	}
+	if routes[0].LinkIndex != 0 && routes[0].LinkIndex != targetLink.Attrs().Index {
+		if routeIf, err := netlink.LinkByIndex(routes[0].LinkIndex); err == nil && routeIf.Attrs() != nil {
+			fmt.Printf(
+				"⚠️ Route mismatch: target %s route uses %s, configured target_interface is %s\n",
+				targetIPStr, routeIf.Attrs().Name, targetIfaceName,
+			)
+		} else {
+			fmt.Printf(
+				"⚠️ Route mismatch: target %s route uses ifindex=%d, configured target_interface is %s\n",
+				targetIPStr, routes[0].LinkIndex, targetIfaceName,
+			)
+		}
 	}
 
 	gw := routes[0].Gw
@@ -174,36 +268,64 @@ func probeNetwork(ifaceName, targetIPStr string) (uint32, [6]byte, [6]byte, erro
 	}
 	gw = gw.To4()
 	if gw == nil {
-		return 0, lMAC, nMAC, fmt.Errorf("invalid gateway ip for %s", targetIPStr)
+		return 0, outMAC, nextHopMAC, relayIfindex, txIfindex, fmt.Errorf("invalid gateway ip for %s", targetIPStr)
 	}
+	triggerIP := snatIPv4
 
 	for i := 0; i < 3; i++ {
-		neighs, _ := netlink.NeighList(nl.Attrs().Index, netlink.FAMILY_V4)
+		neighs, _ := netlink.NeighList(targetLink.Attrs().Index, netlink.FAMILY_V4)
 		for _, n := range neighs {
 			if n.IP != nil && n.IP.Equal(gw) && n.HardwareAddr != nil {
-				copy(nMAC[:], n.HardwareAddr)
-				return localIP, lMAC, nMAC, nil
+				copy(nextHopMAC[:], n.HardwareAddr)
+				return snatIP, outMAC, nextHopMAC, relayIfindex, txIfindex, nil
 			}
 		}
 
 		// 使用 UDP 报文触发内核邻居解析，避免依赖外部 ping 命令。
-		if conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: localIPv4}, &net.UDPAddr{IP: gw, Port: 9}); err == nil {
+		if conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: triggerIP}, &net.UDPAddr{IP: gw, Port: 9}); err == nil {
 			_, _ = conn.Write([]byte{0})
 			_ = conn.Close()
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	return localIP, lMAC, lMAC, fmt.Errorf("ARP not found for gateway %s", gw)
+	return snatIP, outMAC, outMAC, relayIfindex, txIfindex, fmt.Errorf("ARP not found for gateway %s on %s", gw, targetIfaceName)
 }
 
-func attachXDPWithFallback(prog *ebpf.Program, ifIndex int) (link.Link, string, error) {
-	tryModes := []struct {
+func buildRelayRuleValue(relayIP, targetIP uint32, targetPort uint16, relayMAC, nextHopMAC [6]byte, relayIfindex, txIfindex int) []byte {
+	val := make([]byte, 30)
+	binary.LittleEndian.PutUint32(val[0:4], relayIP)
+	binary.LittleEndian.PutUint32(val[4:8], targetIP)
+	binary.LittleEndian.PutUint16(val[8:10], targetPort)
+	copy(val[10:16], relayMAC[:])
+	copy(val[16:22], nextHopMAC[:])
+	binary.LittleEndian.PutUint32(val[22:26], uint32(relayIfindex))
+	binary.LittleEndian.PutUint32(val[26:30], uint32(txIfindex))
+	return val
+}
+
+func attachXDPWithFallback(prog *ebpf.Program, ifIndex int, ifName string) (io.Closer, string, error) {
+	var tryModes []struct {
 		name  string
 		flags link.XDPAttachFlags
-	}{
-		{name: "driver", flags: link.XDPDriverMode},
-		{name: "generic", flags: link.XDPGenericMode},
+	}
+	// veth + redirect 场景优先 generic，兼容性更稳定。
+	if strings.HasPrefix(ifName, "veth") {
+		tryModes = []struct {
+			name  string
+			flags link.XDPAttachFlags
+		}{
+			{name: "generic", flags: link.XDPGenericMode},
+			{name: "driver", flags: link.XDPDriverMode},
+		}
+	} else {
+		tryModes = []struct {
+			name  string
+			flags link.XDPAttachFlags
+		}{
+			{name: "driver", flags: link.XDPDriverMode},
+			{name: "generic", flags: link.XDPGenericMode},
+		}
 	}
 
 	var errs []string
@@ -226,10 +348,92 @@ func attachXDPWithFallback(prog *ebpf.Program, ifIndex int) (link.Link, string, 
 	return nil, "", fmt.Errorf("failed to attach xdp in all modes (%s)", strings.Join(errs, "; "))
 }
 
+func attachTCIngress(prog *ebpf.Program, ifIndex int, ifName string) (io.Closer, error) {
+	l, err := link.AttachTCX(link.TCXOptions{
+		Interface: ifIndex,
+		Program:   prog,
+		Attach:    ebpf.AttachTCXIngress,
+	})
+	if err == nil {
+		return l, nil
+	}
+
+	// 内核 < 6.6 不支持 TCX，退回传统 tc-bpf 注入。
+	if strings.Contains(strings.ToLower(err.Error()), "tcx not supported") {
+		fmt.Printf("⚠️  TCX not supported on %s(%d), falling back to classic tc-bpf\n", ifName, ifIndex)
+		return attachTCClassic(prog, ifIndex, ifName)
+	}
+
+	return nil, fmt.Errorf("attach tcx ingress on %s(%d): %w", ifName, ifIndex, err)
+}
+
+type classicTCLink struct {
+	filter *netlink.BpfFilter
+}
+
+func (c *classicTCLink) Close() error {
+	if c == nil || c.filter == nil {
+		return nil
+	}
+	return netlink.FilterDel(c.filter)
+}
+
+func attachTCClassic(prog *ebpf.Program, ifIndex int, ifName string) (io.Closer, error) {
+	// 确保 clsact qdisc 存在
+	qdisc := &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: ifIndex,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_CLSACT,
+		},
+		QdiscType: "clsact",
+	}
+	if err := netlink.QdiscAdd(qdisc); err != nil {
+		if !strings.Contains(err.Error(), "file exists") {
+			return nil, fmt.Errorf("qdisc add clsact on %s(%d): %w", ifName, ifIndex, err)
+		}
+	}
+
+	// 在 ingress 上挂 bpf filter，direct-action 模式
+	f := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: ifIndex,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  1,
+		},
+		Fd:           prog.FD(),
+		Name:         "tc_relay",
+		DirectAction: true,
+	}
+	if err := netlink.FilterAdd(f); err != nil {
+		return nil, fmt.Errorf("attach classic tc-bpf on %s(%d): %w", ifName, ifIndex, err)
+	}
+
+	return &classicTCLink{filter: f}, nil
+}
+
 func isXDPModeUnsupported(err error) bool {
 	if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EINVAL) {
 		return true
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "operation not supported")
+}
+
+func dumpStatsMap(m *ebpf.Map) {
+	if m == nil {
+		fmt.Println("📊 XDP stats unavailable: stats_map is nil")
+		return
+	}
+	fmt.Println("📊 XDP stats:")
+	for i, name := range statNames {
+		key := uint32(i)
+		var val uint64
+		if err := m.Lookup(&key, &val); err != nil {
+			fmt.Printf("  - %s: lookup error: %v\n", name, err)
+			continue
+		}
+		fmt.Printf("  - %s: %d\n", name, val)
+	}
 }

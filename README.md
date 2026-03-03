@@ -27,14 +27,16 @@
 
 ## 配置示例
 
-`config.json`：
+`config.json`（默认使用 XDP）：
 
 ```json
 {
-  "interface": "eth0",
+  "mode": "xdp",
   "debug": false,
   "rules": [
     {
+      "relay_interface": "eth0",
+      "target_interface": "eth0",
       "relay_port": 9999,
       "target_ip": "161.248.136.126",
       "target_port": 11786
@@ -45,11 +47,17 @@
 
 字段说明：
 
-- `interface`: 挂载 XDP 的网卡名
 - `debug`: 是否开启内核日志
+- `rules[].relay_interface`: 收入流量（Client -> Relay）的接口
+- `rules[].target_interface`: 发往目标与接收回包（Relay <-> Target）的接口
 - `rules[].relay_port`: 中继端口
 - `rules[].target_ip`: 目标 IPv4
 - `rules[].target_port`: 目标端口
+ - `mode`: 可选，`"xdp"`（默认，高性能但对 GRO/TSO 更敏感）或 `"tc"`（使用 TC eBPF，GRO/TSO 兼容性更好）
+
+兼容说明：
+
+- 顶层 `interface` 仍可作为默认值使用（当某条规则未填写 `relay_interface` / `target_interface` 时）。
 
 ## 二进制部署（推荐）
 
@@ -119,7 +127,8 @@ docker compose up -d
    - 确认 root 权限
    - 确认网卡支持 XDP（程序会尝试 `driver`，失败回退 `generic`）
 2. 规则生效但不转发：
-   - 检查 `interface` 是否为实际收包网卡
+   - 检查 `rules[].relay_interface` 是否为实际收包网卡
+   - 检查 `rules[].target_interface` 是否为目标可达网卡
    - 检查目标路由与邻居可达性
 
 ## License

@@ -15,6 +15,8 @@ import (
 const (
 	xdpPass     = 2
 	xdpTx       = 3
+	tcActOK     = 0
+	tcRedirect  = 7
 	ipProtoUDP  = 17
 	ipProtoICMP = 1
 	ethHdrLen   = 14
@@ -26,11 +28,15 @@ const (
 )
 
 type relayObjects struct {
+	TcRelayFunc  *ebpf.Program `ebpf:"tc_relay_func"`
 	XdpRelayFunc *ebpf.Program `ebpf:"xdp_relay_func"`
 	ConfigMap    *ebpf.Map     `ebpf:"config_map"`
 }
 
 func (o *relayObjects) Close() error {
+	if o.TcRelayFunc != nil {
+		_ = o.TcRelayFunc.Close()
+	}
 	if o.XdpRelayFunc != nil {
 		_ = o.XdpRelayFunc.Close()
 	}
@@ -68,7 +74,7 @@ func TestXDPForwardAndReverseRewrite(t *testing.T) {
 	const targetPort = uint16(11786)
 	const clientPort = uint16(54321)
 
-	if err := writeRelayRule(objs.ConfigMap, relayPort, relayIP, targetIP, targetPort, relayMAC, nextHopMAC); err != nil {
+	if err := writeRelayRule(objs.ConfigMap, relayPort, relayIP, targetIP, targetPort, relayMAC, nextHopMAC, 0, 0); err != nil {
 		t.Fatalf("write relay rule: %v", err)
 	}
 
@@ -151,6 +157,114 @@ func TestXDPForwardAndReverseRewrite(t *testing.T) {
 	}
 }
 
+func TestTCForwardAndReverseRewrite(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	if objs.TcRelayFunc == nil {
+		t.Skip("tc_relay_func not available in object")
+	}
+
+	relayIP := "10.10.0.1"
+	targetIP := "172.16.8.9"
+	clientIP := "192.168.50.100"
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	nextHopMAC := [6]byte{0x02, 0xde, 0xad, 0xbe, 0xef, 0x10}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	targetMAC := [6]byte{0x02, 0x66, 0x77, 0x88, 0x99, 0xaa}
+
+	const relayPort = uint16(9999)
+	const targetPort = uint16(11786)
+	const clientPort = uint16(54321)
+
+	if err := writeRelayRule(objs.ConfigMap, relayPort, relayIP, targetIP, targetPort, relayMAC, nextHopMAC, 0, 0); err != nil {
+		t.Fatalf("write relay rule: %v", err)
+	}
+
+	forwardIn := buildUDPPacket(
+		clientMAC,
+		relayMAC,
+		udpTuple{
+			srcIP:   clientIP,
+			dstIP:   relayIP,
+			srcPort: clientPort,
+			dstPort: relayPort,
+		},
+	)
+
+	ret, forwardOut, err := objs.TcRelayFunc.Test(forwardIn)
+	if err != nil {
+		t.Fatalf("tc forward test: %v", err)
+	}
+	if ret != tcRedirect {
+		t.Fatalf("forward action = %d, want TC_ACT_REDIRECT(%d)", ret, tcRedirect)
+	}
+
+	gotDstMAC, gotSrcMAC, gotSrcIP, gotDstIP, gotSrcPort, gotDstPort := decodeUDPPacket(t, forwardOut)
+	if !bytes.Equal(gotDstMAC[:], nextHopMAC[:]) {
+		t.Fatalf("forward dst mac = %x, want %x", gotDstMAC, nextHopMAC)
+	}
+	if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
+		t.Fatalf("forward src mac = %x, want %x", gotSrcMAC, relayMAC)
+	}
+	if gotSrcIP.String() != relayIP {
+		t.Fatalf("forward src ip = %s, want %s", gotSrcIP, relayIP)
+	}
+	if gotDstIP.String() != targetIP {
+		t.Fatalf("forward dst ip = %s, want %s", gotDstIP, targetIP)
+	}
+	if gotDstPort != targetPort {
+		t.Fatalf("forward dst port = %d, want %d", gotDstPort, targetPort)
+	}
+	if gotSrcPort < snatMinPort || gotSrcPort > snatMaxPort {
+		t.Fatalf("snat port out of range: %d", gotSrcPort)
+	}
+
+	reverseIn := buildUDPPacket(
+		targetMAC,
+		relayMAC,
+		udpTuple{
+			srcIP:   targetIP,
+			dstIP:   relayIP,
+			srcPort: targetPort,
+			dstPort: gotSrcPort,
+		},
+	)
+
+	ret, reverseOut, err := objs.TcRelayFunc.Test(reverseIn)
+	if err != nil {
+		t.Fatalf("tc reverse test: %v", err)
+	}
+	if ret != tcRedirect {
+		t.Fatalf("reverse action = %d, want TC_ACT_REDIRECT(%d)", ret, tcRedirect)
+	}
+
+	gotDstMAC, gotSrcMAC, gotSrcIP, gotDstIP, gotSrcPort, gotDstPort = decodeUDPPacket(t, reverseOut)
+	if !bytes.Equal(gotDstMAC[:], clientMAC[:]) {
+		t.Fatalf("reverse dst mac = %x, want %x", gotDstMAC, clientMAC)
+	}
+	if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
+		t.Fatalf("reverse src mac = %x, want %x", gotSrcMAC, relayMAC)
+	}
+	if gotSrcIP.String() != relayIP {
+		t.Fatalf("reverse src ip = %s, want %s", gotSrcIP, relayIP)
+	}
+	if gotDstIP.String() != clientIP {
+		t.Fatalf("reverse dst ip = %s, want %s", gotDstIP, clientIP)
+	}
+	if gotSrcPort != relayPort {
+		t.Fatalf("reverse src port = %d, want %d", gotSrcPort, relayPort)
+	}
+	if gotDstPort != clientPort {
+		t.Fatalf("reverse dst port = %d, want %d", gotDstPort, clientPort)
+	}
+}
+
 func TestXDPNoRulePass(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
@@ -177,6 +291,36 @@ func TestXDPNoRulePass(t *testing.T) {
 	}
 }
 
+func TestTCNoRulePass(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	if objs.TcRelayFunc == nil {
+		t.Skip("tc_relay_func not available in object")
+	}
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	p := buildUDPPacket(clientMAC, relayMAC, udpTuple{
+		srcIP:   "192.168.1.10",
+		dstIP:   "10.0.0.1",
+		srcPort: 50000,
+		dstPort: 9999,
+	})
+
+	ret, _, err := objs.TcRelayFunc.Test(p)
+	if err != nil {
+		t.Fatalf("tc no-rule test: %v", err)
+	}
+	if ret != tcActOK {
+		t.Fatalf("action = %d, want TC_ACT_OK(%d)", ret, tcActOK)
+	}
+}
+
 func TestXDPReverseWithoutSessionPass(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
@@ -200,6 +344,36 @@ func TestXDPReverseWithoutSessionPass(t *testing.T) {
 	}
 	if ret != xdpPass {
 		t.Fatalf("action = %d, want XDP_PASS(%d)", ret, xdpPass)
+	}
+}
+
+func TestTCReverseWithoutSessionPass(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	if objs.TcRelayFunc == nil {
+		t.Skip("tc_relay_func not available in object")
+	}
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	targetMAC := [6]byte{0x02, 0x66, 0x77, 0x88, 0x99, 0xaa}
+	p := buildUDPPacket(targetMAC, relayMAC, udpTuple{
+		srcIP:   "172.16.8.9",
+		dstIP:   "10.10.0.1",
+		srcPort: 11786,
+		dstPort: 60000,
+	})
+
+	ret, _, err := objs.TcRelayFunc.Test(p)
+	if err != nil {
+		t.Fatalf("tc reverse-without-session test: %v", err)
+	}
+	if ret != tcActOK {
+		t.Fatalf("action = %d, want TC_ACT_OK(%d)", ret, tcActOK)
 	}
 }
 
@@ -231,6 +405,37 @@ func TestXDPFragmentPass(t *testing.T) {
 	}
 }
 
+func TestTCFragmentPass(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	if objs.TcRelayFunc == nil {
+		t.Skip("tc_relay_func not available in object")
+	}
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	p := buildUDPPacket(clientMAC, relayMAC, udpTuple{
+		srcIP:   "192.168.1.10",
+		dstIP:   "10.0.0.1",
+		srcPort: 50000,
+		dstPort: 9999,
+	})
+	binary.BigEndian.PutUint16(p[ethHdrLen+6:ethHdrLen+8], 0x2000)
+
+	ret, _, err := objs.TcRelayFunc.Test(p)
+	if err != nil {
+		t.Fatalf("tc fragment test: %v", err)
+	}
+	if ret != tcActOK {
+		t.Fatalf("action = %d, want TC_ACT_OK(%d)", ret, tcActOK)
+	}
+}
+
 func TestXDPUnsupportedProtocolPass(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
@@ -252,6 +457,31 @@ func TestXDPUnsupportedProtocolPass(t *testing.T) {
 	}
 }
 
+func TestTCUnsupportedProtocolPass(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	if objs.TcRelayFunc == nil {
+		t.Skip("tc_relay_func not available in object")
+	}
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	p := buildIPv4Packet(clientMAC, relayMAC, ipProtoICMP, "192.168.1.10", "10.0.0.1")
+
+	ret, _, err := objs.TcRelayFunc.Test(p)
+	if err != nil {
+		t.Fatalf("tc unsupported-protocol test: %v", err)
+	}
+	if ret != tcActOK {
+		t.Fatalf("action = %d, want TC_ACT_OK(%d)", ret, tcActOK)
+	}
+}
+
 func mustLoadRelayObjectsForTest(t *testing.T) *relayObjects {
 	t.Helper()
 
@@ -267,16 +497,18 @@ func mustLoadRelayObjectsForTest(t *testing.T) *relayObjects {
 	return objs
 }
 
-func writeRelayRule(m *ebpf.Map, relayPort uint16, relayIP, targetIP string, targetPort uint16, relayMAC, nextHopMAC [6]byte) error {
+func writeRelayRule(m *ebpf.Map, relayPort uint16, relayIP, targetIP string, targetPort uint16, relayMAC, nextHopMAC [6]byte, relayIfindex, txIfindex uint32) error {
 	key := make([]byte, 2)
 	binary.LittleEndian.PutUint16(key, htons(relayPort))
 
-	val := make([]byte, 22)
+	val := make([]byte, 30)
 	binary.LittleEndian.PutUint32(val[0:4], ip4ToU32LE(relayIP))
 	binary.LittleEndian.PutUint32(val[4:8], ip4ToU32LE(targetIP))
 	binary.LittleEndian.PutUint16(val[8:10], htons(targetPort))
 	copy(val[10:16], relayMAC[:])
 	copy(val[16:22], nextHopMAC[:])
+	binary.LittleEndian.PutUint32(val[22:26], relayIfindex)
+	binary.LittleEndian.PutUint32(val[26:30], txIfindex)
 
 	return m.Update(key, val, ebpf.UpdateAny)
 }

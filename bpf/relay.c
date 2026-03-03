@@ -8,6 +8,7 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/in.h>
+#include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -23,12 +24,44 @@
 
 volatile const __u32 debug_enabled SEC(".data");
 
+enum stat_key
+{
+    STAT_FORWARD_HIT = 0,
+    STAT_REVERSE_HIT = 1,
+    STAT_REDIRECT = 2,
+    STAT_PASS = 3,
+    STAT_DROP = 4,
+    STAT_MAX = 5,
+};
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, STAT_MAX);
+    __type(key, __u32);
+    __type(value, __u64);
+} stats_map SEC(".maps");
+
 // 定义一个宏，方便调用
 #define DEBUG_PRINTK(fmt, ...)              \
     do                                      \
     {                                       \
         if (debug_enabled)                  \
             bpf_printk(fmt, ##__VA_ARGS__); \
+    } while (0)
+
+static __always_inline void inc_stat(__u32 k)
+{
+    __u64 *v = bpf_map_lookup_elem(&stats_map, &k);
+    if (v)
+        __sync_fetch_and_add(v, 1);
+}
+
+#define RETURN_PASS()        \
+    do                       \
+    {                        \
+        inc_stat(STAT_PASS); \
+        return XDP_PASS;     \
     } while (0)
 
 struct relay_rule
@@ -38,6 +71,8 @@ struct relay_rule
     __u16 target_port; // network order (raw like tcp/udp header field)
     unsigned char relay_mac[6];
     unsigned char next_hop_mac[6];
+    __u32 relay_ifindex; // ingress ifindex for client->relay traffic
+    __u32 tx_ifindex; // egress ifindex for forward path (0 => XDP_TX)
 } __attribute__((packed));
 
 // Key: relay service port (network order raw)
@@ -70,7 +105,7 @@ struct fwd_val
     __u16 snat_port;   // raw (allocated)
     unsigned char relay_mac[6];
     unsigned char next_hop_mac[6];
-    __u16 pad;
+    __u32 tx_ifindex; // 0 => XDP_TX, otherwise redirect to this ifindex
 };
 
 // reverse key: (snat_ip, target_ip, target_port, snat_port, proto)
@@ -91,8 +126,10 @@ struct rev_val
     __u32 client_ip;    // raw
     __u16 client_port;  // raw
     __u16 service_port; // raw (client sees src port as this)
+    __u32 vip;          // original destination ip from client packet
     unsigned char client_mac[6];
-    __u16 pad;
+    unsigned char relay_mac[6]; // relay MAC observed by client on ingress
+    __u32 client_ifindex;       // ingress ifindex for return redirect
 };
 
 // LRU: UDP 没有 close，必须 LRU
@@ -197,17 +234,17 @@ int xdp_relay_func(struct xdp_md *ctx)
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return XDP_PASS;
+        RETURN_PASS();
 
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return XDP_PASS;
+        RETURN_PASS();
 
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
-        return XDP_PASS;
+        RETURN_PASS();
 
     if (iph->version != 4)
-        return XDP_PASS;
+        RETURN_PASS();
 
     // 1. 日志：捕获到 IP 包
     __u8 proto = iph->protocol;
@@ -221,29 +258,29 @@ int xdp_relay_func(struct xdp_md *ctx)
     }
     else
     {
-        return XDP_PASS;
+        RETURN_PASS();
     }
 
     // drop fragments (no完整L4)
     if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
     {
         DEBUG_PRINTK("DEBUG: Dropping fragmented packet from %pI4", &iph->saddr);
-        return XDP_PASS;
+        RETURN_PASS();
     }
 
     // support IP options
     __u32 ihl_bytes = (__u32)iph->ihl * 4;
     if (ihl_bytes < sizeof(*iph))
-        return XDP_PASS;
+        RETURN_PASS();
 
     void *l4 = (void *)((char *)iph + ihl_bytes);
     if ((void *)((char *)l4 + sizeof(struct udphdr)) > data_end)
-        return XDP_PASS;
+        RETURN_PASS();
 
     __u16 *sportp = 0, *dportp = 0, *checkp = 0;
     struct tcphdr *tcph = 0;
     if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp, &tcph) < 0)
-        return XDP_PASS;
+        RETURN_PASS();
 
     __u16 sport = *sportp;
     __u16 dport = *dportp;
@@ -273,10 +310,11 @@ int xdp_relay_func(struct xdp_md *ctx)
     struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
     if (rval)
     {
+        inc_stat(STAT_REVERSE_HIT);
         DEBUG_PRINTK("DEBUG: Found Rev Map! NAT to Client %pI4:%d", &rval->client_ip, bpf_ntohs(rval->client_port));
         __u32 old_saddr = iph->saddr; // target
         __u32 old_daddr = iph->daddr; // snat_ip
-        __u32 new_saddr = old_daddr;  // relay ip
+        __u32 new_saddr = rval->vip;  // restore original vip seen by client
         __u32 new_daddr = rval->client_ip;
 
         __u16 old_sport = sport;
@@ -308,12 +346,15 @@ int xdp_relay_func(struct xdp_md *ctx)
         *sportp = new_sport;
         *dportp = new_dport;
 
-        // L2 rewrite: dst=client_mac, src=self_mac(=incoming dst mac)
-        unsigned char self_mac[6];
-        __builtin_memcpy(self_mac, eth->h_dest, 6);
+        // L2 rewrite: dst=client_mac, src=relay_mac captured on client ingress
         __builtin_memcpy(eth->h_dest, rval->client_mac, 6);
-        __builtin_memcpy(eth->h_source, self_mac, 6);
+        __builtin_memcpy(eth->h_source, rval->relay_mac, 6);
 
+        if (rval->client_ifindex != 0 && rval->client_ifindex != ctx->ingress_ifindex)
+        {
+            inc_stat(STAT_REDIRECT);
+            return bpf_redirect(rval->client_ifindex, 0);
+        }
         return XDP_TX;
     }
 
@@ -339,8 +380,10 @@ int xdp_relay_func(struct xdp_md *ctx)
             // 打印 dport 的原始数值和转换后的数值
             DEBUG_PRINTK("DEBUG: Port Lookup Failed. Raw(Network): %d, Host: %d",
                          dport, bpf_ntohs(dport));
-            return XDP_PASS;
+            RETURN_PASS();
         }
+        if (rule->relay_ifindex != 0 && rule->relay_ifindex != ctx->ingress_ifindex)
+            RETURN_PASS();
 
         DEBUG_PRINTK("MATCH: Config rule found, creating new session");
         // Build reverse reservation template
@@ -356,13 +399,16 @@ int xdp_relay_func(struct xdp_md *ctx)
             .client_ip = iph->saddr,
             .client_port = sport,
             .service_port = dport,
+            .vip = iph->daddr,
+            .client_ifindex = ctx->ingress_ifindex,
         };
         __builtin_memcpy(new_rval.client_mac, eth->h_source, 6);
+        __builtin_memcpy(new_rval.relay_mac, eth->h_dest, 6);
 
         // Allocate + reserve snat_port via rev_map insert
         __u16 snat_port = alloc_snat_port(bpf_get_prandom_u32(), &new_rkey, &new_rval);
         if (snat_port == 0)
-            return XDP_PASS; // no port available (or too many collisions)
+            RETURN_PASS(); // no port available (or too many collisions)
 
         // Build fwd_val (store resolved info + L2 data) so fast path doesn't touch config_map
         new_fval.snat_ip = rule->relay_ip;
@@ -371,6 +417,7 @@ int xdp_relay_func(struct xdp_md *ctx)
         new_fval.snat_port = snat_port;
         __builtin_memcpy(new_fval.relay_mac, rule->relay_mac, 6);
         __builtin_memcpy(new_fval.next_hop_mac, rule->next_hop_mac, 6);
+        new_fval.tx_ifindex = rule->tx_ifindex;
 
         // Insert fwd_map; if lose race, cleanup rev reservation and use existing mapping
         if (bpf_map_update_elem(&fwd_map, &fkey, &new_fval, BPF_NOEXIST) != 0)
@@ -380,7 +427,7 @@ int xdp_relay_func(struct xdp_md *ctx)
 
             fval = bpf_map_lookup_elem(&fwd_map, &fkey);
             if (!fval)
-                return XDP_PASS; // extremely rare
+                RETURN_PASS(); // extremely rare
         }
         else
         {
@@ -394,6 +441,7 @@ int xdp_relay_func(struct xdp_md *ctx)
 
     // Now apply forward NAT using fval
     {
+        inc_stat(STAT_FORWARD_HIT);
         __u32 old_saddr = iph->saddr;    // client
         __u32 old_daddr = iph->daddr;    // vip
         __u32 new_saddr = fval->snat_ip; // relay ip
@@ -432,8 +480,228 @@ int xdp_relay_func(struct xdp_md *ctx)
         __builtin_memcpy(eth->h_dest, fval->next_hop_mac, 6);
         __builtin_memcpy(eth->h_source, fval->relay_mac, 6);
 
+        if (fval->tx_ifindex != 0 && fval->tx_ifindex != ctx->ingress_ifindex)
+        {
+            inc_stat(STAT_REDIRECT);
+            return bpf_redirect(fval->tx_ifindex, 0);
+        }
         return XDP_TX;
     }
+}
+
+// TC clsact 版本：在 __sk_buff 上复用相同的 NAT 转发逻辑。
+#define RETURN_TC_OK()       \
+    do                       \
+    {                        \
+        inc_stat(STAT_PASS); \
+        return TC_ACT_OK;    \
+    } while (0)
+
+static __always_inline int tc_redirect_tx(__u32 ifindex)
+{
+    return bpf_redirect(ifindex, 0);
+}
+
+SEC("tc")
+int tc_relay_func(struct __sk_buff *skb)
+{
+    void *data_end = (void *)(long)skb->data_end;
+    void *data = (void *)(long)skb->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        RETURN_TC_OK();
+
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        RETURN_TC_OK();
+
+    struct iphdr *iph = (void *)(eth + 1);
+    if ((void *)(iph + 1) > data_end)
+        RETURN_TC_OK();
+
+    if (iph->version != 4)
+        RETURN_TC_OK();
+
+    __u8 proto = iph->protocol;
+    if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+        RETURN_TC_OK();
+
+    if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+        RETURN_TC_OK();
+
+    __u32 ihl_bytes = (__u32)iph->ihl * 4;
+    if (ihl_bytes < sizeof(*iph))
+        RETURN_TC_OK();
+
+    void *l4 = (void *)((char *)iph + ihl_bytes);
+    if ((void *)((char *)l4 + sizeof(struct udphdr)) > data_end)
+        RETURN_TC_OK();
+
+    __u16 *sportp = 0, *dportp = 0, *checkp = 0;
+    struct tcphdr *tcph = 0;
+    if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp, &tcph) < 0)
+        RETURN_TC_OK();
+
+    __u16 sport = *sportp;
+    __u16 dport = *dportp;
+
+    struct rev_key rkey = {
+        .snat_ip = iph->daddr,
+        .target_ip = iph->saddr,
+        .target_port = sport,
+        .snat_port = dport,
+        .proto = proto,
+    };
+
+    struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
+    if (rval)
+    {
+        inc_stat(STAT_REVERSE_HIT);
+
+        __u32 old_saddr = iph->saddr;
+        __u32 old_daddr = iph->daddr;
+        __u32 new_saddr = rval->vip;
+        __u32 new_daddr = rval->client_ip;
+
+        __u16 old_sport = sport;
+        __u16 old_dport = dport;
+        __u16 new_sport = rval->service_port;
+        __u16 new_dport = rval->client_port;
+
+        __u16 old_l4_csum = *checkp;
+
+        l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+        l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+        l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+        l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+        l4_csum_replace16(proto, checkp, old_sport, new_sport);
+        l4_csum_replace16(proto, checkp, old_dport, new_dport);
+        udp_csum_fixup_zero(proto, checkp, old_l4_csum);
+
+        update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+        update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+        update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+        update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+        iph->saddr = new_saddr;
+        iph->daddr = new_daddr;
+        *sportp = new_sport;
+        *dportp = new_dport;
+
+        __builtin_memcpy(eth->h_dest, rval->client_mac, 6);
+        __builtin_memcpy(eth->h_source, rval->relay_mac, 6);
+
+        __u32 tx_ifindex = rval->client_ifindex ? rval->client_ifindex : skb->ifindex;
+        if (tx_ifindex != skb->ifindex)
+            inc_stat(STAT_REDIRECT);
+        return tc_redirect_tx(tx_ifindex);
+    }
+
+    struct fwd_key fkey = {
+        .vip = iph->daddr,
+        .client_ip = iph->saddr,
+        .service_port = dport,
+        .client_port = sport,
+        .proto = proto,
+    };
+
+    struct fwd_val *fval = bpf_map_lookup_elem(&fwd_map, &fkey);
+    struct fwd_val new_fval;
+
+    if (!fval)
+    {
+        struct relay_rule *rule = bpf_map_lookup_elem(&config_map, &dport);
+        if (!rule)
+            RETURN_TC_OK();
+
+        if (rule->relay_ifindex != 0 && rule->relay_ifindex != skb->ifindex)
+            RETURN_TC_OK();
+
+        struct rev_key new_rkey = {
+            .snat_ip = rule->relay_ip,
+            .target_ip = rule->target_ip,
+            .target_port = rule->target_port,
+            .snat_port = 0,
+            .proto = proto,
+        };
+
+        struct rev_val new_rval = {
+            .client_ip = iph->saddr,
+            .client_port = sport,
+            .service_port = dport,
+            .vip = iph->daddr,
+            .client_ifindex = skb->ifindex,
+        };
+        __builtin_memcpy(new_rval.client_mac, eth->h_source, 6);
+        __builtin_memcpy(new_rval.relay_mac, eth->h_dest, 6);
+
+        __u16 snat_port = alloc_snat_port(bpf_get_prandom_u32(), &new_rkey, &new_rval);
+        if (snat_port == 0)
+            RETURN_TC_OK();
+
+        new_fval.snat_ip = rule->relay_ip;
+        new_fval.target_ip = rule->target_ip;
+        new_fval.target_port = rule->target_port;
+        new_fval.snat_port = snat_port;
+        __builtin_memcpy(new_fval.relay_mac, rule->relay_mac, 6);
+        __builtin_memcpy(new_fval.next_hop_mac, rule->next_hop_mac, 6);
+        new_fval.tx_ifindex = rule->tx_ifindex;
+
+        if (bpf_map_update_elem(&fwd_map, &fkey, &new_fval, BPF_NOEXIST) != 0)
+        {
+            bpf_map_delete_elem(&rev_map, &new_rkey);
+
+            fval = bpf_map_lookup_elem(&fwd_map, &fkey);
+            if (!fval)
+                RETURN_TC_OK();
+        }
+        else
+        {
+            fval = &new_fval;
+        }
+    }
+
+    inc_stat(STAT_FORWARD_HIT);
+
+    __u32 old_saddr = iph->saddr;
+    __u32 old_daddr = iph->daddr;
+    __u32 new_saddr = fval->snat_ip;
+    __u32 new_daddr = fval->target_ip;
+
+    __u16 old_sport = sport;
+    __u16 old_dport = dport;
+    __u16 new_sport = fval->snat_port;
+    __u16 new_dport = fval->target_port;
+
+    __u16 old_l4_csum = *checkp;
+
+    l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+    l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+    l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+    l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+    l4_csum_replace16(proto, checkp, old_sport, new_sport);
+    l4_csum_replace16(proto, checkp, old_dport, new_dport);
+    udp_csum_fixup_zero(proto, checkp, old_l4_csum);
+
+    update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+    update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+    update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+    update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+    iph->saddr = new_saddr;
+    iph->daddr = new_daddr;
+    *sportp = new_sport;
+    *dportp = new_dport;
+
+    __builtin_memcpy(eth->h_dest, fval->next_hop_mac, 6);
+    __builtin_memcpy(eth->h_source, fval->relay_mac, 6);
+
+    __u32 tx_ifindex = fval->tx_ifindex ? fval->tx_ifindex : skb->ifindex;
+    if (tx_ifindex != skb->ifindex)
+        inc_stat(STAT_REDIRECT);
+    return tc_redirect_tx(tx_ifindex);
 }
 
 char _license[] SEC("license") = "GPL";
