@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -20,8 +21,9 @@ import (
 )
 
 type Config struct {
-	Interface string `json:"interface"` // legacy default interface
-	Debug     bool   `json:"debug"`     // JSON 中不写则默认为 false
+	Interface string `json:"interface"`        // legacy default interface
+	Mode      string `json:"mode"`             // "xdp" (default) or "tc"
+	Debug     bool   `json:"debug"`            // JSON 中不写则默认为 false
 	Rules     []struct {
 		RelayInterface  string `json:"relay_interface"`
 		TargetInterface string `json:"target_interface"`
@@ -167,14 +169,28 @@ func main() {
 		log.Fatalf("no valid rules loaded; nothing to attach")
 	}
 
-	var links []link.Link
+	mode := strings.ToLower(conf.Mode)
+	if mode == "" {
+		mode = "xdp"
+	}
+
+	var links []io.Closer
 	for ifidx, ifname := range attachIfs {
-		l, mode, err := attachXDPWithFallback(objs.XdpRelayFunc, ifidx, ifname)
-		if err != nil {
-			log.Fatalf("Attach XDP on %s(%d): %v", ifname, ifidx, err)
+		if mode == "tc" {
+			l, err := attachTCIngress(objs.TcRelayFunc, ifidx, ifname)
+			if err != nil {
+				log.Fatalf("Attach TC on %s(%d): %v", ifname, ifidx, err)
+			}
+			links = append(links, l)
+			fmt.Printf("🚀 TC program attached to interface %s (hook=clsact/ingress)\n", ifname)
+		} else {
+			l, xdpMode, err := attachXDPWithFallback(objs.XdpRelayFunc, ifidx, ifname)
+			if err != nil {
+				log.Fatalf("Attach XDP on %s(%d): %v", ifname, ifidx, err)
+			}
+			links = append(links, l)
+			fmt.Printf("🚀 XDP program attached to interface %s (mode=%s)\n", ifname, xdpMode)
 		}
-		links = append(links, l)
-		fmt.Printf("🚀 XDP program attached to interface %s (mode=%s)\n", ifname, mode)
 	}
 	defer func() {
 		for _, l := range links {
@@ -288,7 +304,7 @@ func buildRelayRuleValue(relayIP, targetIP uint32, targetPort uint16, relayMAC, 
 	return val
 }
 
-func attachXDPWithFallback(prog *ebpf.Program, ifIndex int, ifName string) (link.Link, string, error) {
+func attachXDPWithFallback(prog *ebpf.Program, ifIndex int, ifName string) (io.Closer, string, error) {
 	var tryModes []struct {
 		name  string
 		flags link.XDPAttachFlags
@@ -330,6 +346,71 @@ func attachXDPWithFallback(prog *ebpf.Program, ifIndex int, ifName string) (link
 	}
 
 	return nil, "", fmt.Errorf("failed to attach xdp in all modes (%s)", strings.Join(errs, "; "))
+}
+
+func attachTCIngress(prog *ebpf.Program, ifIndex int, ifName string) (io.Closer, error) {
+	l, err := link.AttachTCX(link.TCXOptions{
+		Interface: ifIndex,
+		Program:   prog,
+		Attach:    ebpf.AttachTCXIngress,
+	})
+	if err == nil {
+		return l, nil
+	}
+
+	// 内核 < 6.6 不支持 TCX，退回传统 tc-bpf 注入。
+	if strings.Contains(strings.ToLower(err.Error()), "tcx not supported") {
+		fmt.Printf("⚠️  TCX not supported on %s(%d), falling back to classic tc-bpf\n", ifName, ifIndex)
+		return attachTCClassic(prog, ifIndex, ifName)
+	}
+
+	return nil, fmt.Errorf("attach tcx ingress on %s(%d): %w", ifName, ifIndex, err)
+}
+
+type classicTCLink struct {
+	filter *netlink.BpfFilter
+}
+
+func (c *classicTCLink) Close() error {
+	if c == nil || c.filter == nil {
+		return nil
+	}
+	return netlink.FilterDel(c.filter)
+}
+
+func attachTCClassic(prog *ebpf.Program, ifIndex int, ifName string) (io.Closer, error) {
+	// 确保 clsact qdisc 存在
+	qdisc := &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: ifIndex,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_CLSACT,
+		},
+		QdiscType: "clsact",
+	}
+	if err := netlink.QdiscAdd(qdisc); err != nil {
+		if !strings.Contains(err.Error(), "file exists") {
+			return nil, fmt.Errorf("qdisc add clsact on %s(%d): %w", ifName, ifIndex, err)
+		}
+	}
+
+	// 在 ingress 上挂 bpf filter，direct-action 模式
+	f := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: ifIndex,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  1,
+		},
+		Fd:           prog.FD(),
+		Name:         "tc_relay",
+		DirectAction: true,
+	}
+	if err := netlink.FilterAdd(f); err != nil {
+		return nil, fmt.Errorf("attach classic tc-bpf on %s(%d): %w", ifName, ifIndex, err)
+	}
+
+	return &classicTCLink{filter: f}, nil
 }
 
 func isXDPModeUnsupported(err error) bool {

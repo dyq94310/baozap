@@ -27,10 +27,11 @@
 
 ## 配置示例
 
-`config.json`：
+`config.json`（默认使用 XDP）：
 
 ```json
 {
+  "mode": "xdp",
   "debug": false,
   "rules": [
     {
@@ -52,6 +53,7 @@
 - `rules[].relay_port`: 中继端口
 - `rules[].target_ip`: 目标 IPv4
 - `rules[].target_port`: 目标端口
+ - `mode`: 可选，`"xdp"`（默认，高性能但对 GRO/TSO 更敏感）或 `"tc"`（使用 TC eBPF，GRO/TSO 兼容性更好）
 
 兼容说明：
 

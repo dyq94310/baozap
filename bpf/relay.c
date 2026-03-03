@@ -8,6 +8,7 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/in.h>
+#include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -486,6 +487,221 @@ int xdp_relay_func(struct xdp_md *ctx)
         }
         return XDP_TX;
     }
+}
+
+// TC clsact 版本：在 __sk_buff 上复用相同的 NAT 转发逻辑。
+#define RETURN_TC_OK()       \
+    do                       \
+    {                        \
+        inc_stat(STAT_PASS); \
+        return TC_ACT_OK;    \
+    } while (0)
+
+static __always_inline int tc_redirect_tx(__u32 ifindex)
+{
+    return bpf_redirect(ifindex, 0);
+}
+
+SEC("tc")
+int tc_relay_func(struct __sk_buff *skb)
+{
+    void *data_end = (void *)(long)skb->data_end;
+    void *data = (void *)(long)skb->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        RETURN_TC_OK();
+
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        RETURN_TC_OK();
+
+    struct iphdr *iph = (void *)(eth + 1);
+    if ((void *)(iph + 1) > data_end)
+        RETURN_TC_OK();
+
+    if (iph->version != 4)
+        RETURN_TC_OK();
+
+    __u8 proto = iph->protocol;
+    if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+        RETURN_TC_OK();
+
+    if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+        RETURN_TC_OK();
+
+    __u32 ihl_bytes = (__u32)iph->ihl * 4;
+    if (ihl_bytes < sizeof(*iph))
+        RETURN_TC_OK();
+
+    void *l4 = (void *)((char *)iph + ihl_bytes);
+    if ((void *)((char *)l4 + sizeof(struct udphdr)) > data_end)
+        RETURN_TC_OK();
+
+    __u16 *sportp = 0, *dportp = 0, *checkp = 0;
+    struct tcphdr *tcph = 0;
+    if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp, &tcph) < 0)
+        RETURN_TC_OK();
+
+    __u16 sport = *sportp;
+    __u16 dport = *dportp;
+
+    struct rev_key rkey = {
+        .snat_ip = iph->daddr,
+        .target_ip = iph->saddr,
+        .target_port = sport,
+        .snat_port = dport,
+        .proto = proto,
+    };
+
+    struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
+    if (rval)
+    {
+        inc_stat(STAT_REVERSE_HIT);
+
+        __u32 old_saddr = iph->saddr;
+        __u32 old_daddr = iph->daddr;
+        __u32 new_saddr = rval->vip;
+        __u32 new_daddr = rval->client_ip;
+
+        __u16 old_sport = sport;
+        __u16 old_dport = dport;
+        __u16 new_sport = rval->service_port;
+        __u16 new_dport = rval->client_port;
+
+        __u16 old_l4_csum = *checkp;
+
+        l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+        l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+        l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+        l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+        l4_csum_replace16(proto, checkp, old_sport, new_sport);
+        l4_csum_replace16(proto, checkp, old_dport, new_dport);
+        udp_csum_fixup_zero(proto, checkp, old_l4_csum);
+
+        update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+        update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+        update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+        update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+        iph->saddr = new_saddr;
+        iph->daddr = new_daddr;
+        *sportp = new_sport;
+        *dportp = new_dport;
+
+        __builtin_memcpy(eth->h_dest, rval->client_mac, 6);
+        __builtin_memcpy(eth->h_source, rval->relay_mac, 6);
+
+        __u32 tx_ifindex = rval->client_ifindex ? rval->client_ifindex : skb->ifindex;
+        if (tx_ifindex != skb->ifindex)
+            inc_stat(STAT_REDIRECT);
+        return tc_redirect_tx(tx_ifindex);
+    }
+
+    struct fwd_key fkey = {
+        .vip = iph->daddr,
+        .client_ip = iph->saddr,
+        .service_port = dport,
+        .client_port = sport,
+        .proto = proto,
+    };
+
+    struct fwd_val *fval = bpf_map_lookup_elem(&fwd_map, &fkey);
+    struct fwd_val new_fval;
+
+    if (!fval)
+    {
+        struct relay_rule *rule = bpf_map_lookup_elem(&config_map, &dport);
+        if (!rule)
+            RETURN_TC_OK();
+
+        if (rule->relay_ifindex != 0 && rule->relay_ifindex != skb->ifindex)
+            RETURN_TC_OK();
+
+        struct rev_key new_rkey = {
+            .snat_ip = rule->relay_ip,
+            .target_ip = rule->target_ip,
+            .target_port = rule->target_port,
+            .snat_port = 0,
+            .proto = proto,
+        };
+
+        struct rev_val new_rval = {
+            .client_ip = iph->saddr,
+            .client_port = sport,
+            .service_port = dport,
+            .vip = iph->daddr,
+            .client_ifindex = skb->ifindex,
+        };
+        __builtin_memcpy(new_rval.client_mac, eth->h_source, 6);
+        __builtin_memcpy(new_rval.relay_mac, eth->h_dest, 6);
+
+        __u16 snat_port = alloc_snat_port(bpf_get_prandom_u32(), &new_rkey, &new_rval);
+        if (snat_port == 0)
+            RETURN_TC_OK();
+
+        new_fval.snat_ip = rule->relay_ip;
+        new_fval.target_ip = rule->target_ip;
+        new_fval.target_port = rule->target_port;
+        new_fval.snat_port = snat_port;
+        __builtin_memcpy(new_fval.relay_mac, rule->relay_mac, 6);
+        __builtin_memcpy(new_fval.next_hop_mac, rule->next_hop_mac, 6);
+        new_fval.tx_ifindex = rule->tx_ifindex;
+
+        if (bpf_map_update_elem(&fwd_map, &fkey, &new_fval, BPF_NOEXIST) != 0)
+        {
+            bpf_map_delete_elem(&rev_map, &new_rkey);
+
+            fval = bpf_map_lookup_elem(&fwd_map, &fkey);
+            if (!fval)
+                RETURN_TC_OK();
+        }
+        else
+        {
+            fval = &new_fval;
+        }
+    }
+
+    inc_stat(STAT_FORWARD_HIT);
+
+    __u32 old_saddr = iph->saddr;
+    __u32 old_daddr = iph->daddr;
+    __u32 new_saddr = fval->snat_ip;
+    __u32 new_daddr = fval->target_ip;
+
+    __u16 old_sport = sport;
+    __u16 old_dport = dport;
+    __u16 new_sport = fval->snat_port;
+    __u16 new_dport = fval->target_port;
+
+    __u16 old_l4_csum = *checkp;
+
+    l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+    l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+    l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+    l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+    l4_csum_replace16(proto, checkp, old_sport, new_sport);
+    l4_csum_replace16(proto, checkp, old_dport, new_dport);
+    udp_csum_fixup_zero(proto, checkp, old_l4_csum);
+
+    update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
+    update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
+    update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
+    update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+
+    iph->saddr = new_saddr;
+    iph->daddr = new_daddr;
+    *sportp = new_sport;
+    *dportp = new_dport;
+
+    __builtin_memcpy(eth->h_dest, fval->next_hop_mac, 6);
+    __builtin_memcpy(eth->h_source, fval->relay_mac, 6);
+
+    __u32 tx_ifindex = fval->tx_ifindex ? fval->tx_ifindex : skb->ifindex;
+    if (tx_ifindex != skb->ifindex)
+        inc_stat(STAT_REDIRECT);
+    return tc_redirect_tx(tx_ifindex);
 }
 
 char _license[] SEC("license") = "GPL";

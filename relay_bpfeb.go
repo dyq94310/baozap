@@ -110,6 +110,7 @@ type relaySpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type relayProgramSpecs struct {
+	TcRelayFunc  *ebpf.ProgramSpec `ebpf:"tc_relay_func"`
 	XdpRelayFunc *ebpf.ProgramSpec `ebpf:"xdp_relay_func"`
 }
 
@@ -176,11 +177,13 @@ type relayVariables struct {
 //
 // It can be passed to loadRelayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type relayPrograms struct {
+	TcRelayFunc  *ebpf.Program `ebpf:"tc_relay_func"`
 	XdpRelayFunc *ebpf.Program `ebpf:"xdp_relay_func"`
 }
 
 func (p *relayPrograms) Close() error {
 	return _RelayClose(
+		p.TcRelayFunc,
 		p.XdpRelayFunc,
 	)
 }
