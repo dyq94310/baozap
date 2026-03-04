@@ -21,10 +21,9 @@ import (
 )
 
 type Config struct {
-	Interface string `json:"interface"`        // legacy default interface
-	Mode      string `json:"mode"`             // "xdp" (default) or "tc"
-	Debug     bool   `json:"debug"`            // JSON 中不写则默认为 false
-	Rules     []struct {
+	Mode  string `json:"mode"`  // "xdp" or "tc"
+	Debug bool   `json:"debug"` // JSON 中不写则默认为 false
+	Rules []struct {
 		RelayInterface  string `json:"relay_interface"`
 		TargetInterface string `json:"target_interface"`
 		RelayPort       uint16 `json:"relay_port"`
@@ -111,9 +110,6 @@ func main() {
 	attachIfs := map[int]string{}
 	for _, rule := range conf.Rules {
 		relayIf := rule.RelayInterface
-		if relayIf == "" {
-			relayIf = conf.Interface
-		}
 		targetIf := rule.TargetInterface
 		if targetIf == "" {
 			targetIf = relayIf
@@ -171,7 +167,7 @@ func main() {
 
 	mode := strings.ToLower(conf.Mode)
 	if mode == "" {
-		mode = "xdp"
+		mode = "tc"
 	}
 
 	var links []io.Closer

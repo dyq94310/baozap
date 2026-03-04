@@ -27,11 +27,11 @@
 
 ## 配置示例
 
-`config.json`（默认使用 XDP）：
+`config.json`（默认使用 TC eBPF，在不升级内核的前提下对 GRO/TSO 更友好）：
 
 ```json
 {
-  "mode": "xdp",
+  "mode": "tc",
   "debug": false,
   "rules": [
     {
@@ -53,11 +53,7 @@
 - `rules[].relay_port`: 中继端口
 - `rules[].target_ip`: 目标 IPv4
 - `rules[].target_port`: 目标端口
- - `mode`: 可选，`"xdp"`（默认，高性能但对 GRO/TSO 更敏感）或 `"tc"`（使用 TC eBPF，GRO/TSO 兼容性更好）
-
-兼容说明：
-
-- 顶层 `interface` 仍可作为默认值使用（当某条规则未填写 `relay_interface` / `target_interface` 时）。
+ - `mode`: 可选，`"tc"`（默认，使用 TC eBPF，GRO/TSO 兼容性更好，内核 < 6.6 时自动使用传统 tc-bpf 注入）或 `"xdp"`（纯 XDP，性能更高但对 offload 更敏感）
 
 ## 二进制部署（推荐）
 

@@ -1,3 +1,3 @@
 package baozaptest
 
-// This package hosts xdp_integration tests behind build tags.
+// This package hosts dataplane (XDP/TC) integration tests behind build tags.
