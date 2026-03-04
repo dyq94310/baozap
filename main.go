@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -427,11 +428,23 @@ func dumpStatsMap(m *ebpf.Map) {
 	fmt.Println("📊 XDP stats:")
 	for i, name := range statNames {
 		key := uint32(i)
-		var val uint64
-		if err := m.Lookup(&key, &val); err != nil {
-			fmt.Printf("  - %s: lookup error: %v\n", name, err)
+		perCPU := make([]uint64, runtime.NumCPU())
+		if err := m.Lookup(&key, &perCPU); err == nil {
+			var total uint64
+			for _, v := range perCPU {
+				total += v
+			}
+			fmt.Printf("  - %s: %d\n", name, total)
 			continue
 		}
-		fmt.Printf("  - %s: %d\n", name, val)
+
+		// Backward compatibility for non-percpu map objects.
+		var val uint64
+		if err := m.Lookup(&key, &val); err == nil {
+			fmt.Printf("  - %s: %d\n", name, val)
+			continue
+		}
+
+		fmt.Printf("  - %s: lookup error\n", name)
 	}
 }

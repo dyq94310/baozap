@@ -36,7 +36,7 @@ enum stat_key
 
 struct
 {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, STAT_MAX);
     __type(key, __u32);
     __type(value, __u64);
@@ -52,9 +52,13 @@ struct
 
 static __always_inline void inc_stat(__u32 k)
 {
+    // Keep the forwarding hot path minimal unless debug is explicitly enabled.
+    if (!debug_enabled)
+        return;
+
     __u64 *v = bpf_map_lookup_elem(&stats_map, &k);
     if (v)
-        __sync_fetch_and_add(v, 1);
+        (*v)++;
 }
 
 #define RETURN_PASS()        \
@@ -490,10 +494,15 @@ int xdp_relay_func(struct xdp_md *ctx)
 }
 
 // TC clsact 版本：在 __sk_buff 上复用相同的 NAT 转发逻辑。
+#define TC_INC_STAT(k) \
+    do                 \
+    {                  \
+    } while (0)
+
 #define RETURN_TC_OK()       \
     do                       \
     {                        \
-        inc_stat(STAT_PASS); \
+        TC_INC_STAT(STAT_PASS); \
         return TC_ACT_OK;    \
     } while (0)
 
@@ -556,7 +565,7 @@ int tc_relay_func(struct __sk_buff *skb)
     struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
     if (rval)
     {
-        inc_stat(STAT_REVERSE_HIT);
+        TC_INC_STAT(STAT_REVERSE_HIT);
 
         __u32 old_saddr = iph->saddr;
         __u32 old_daddr = iph->daddr;
@@ -594,7 +603,7 @@ int tc_relay_func(struct __sk_buff *skb)
 
         __u32 tx_ifindex = rval->client_ifindex ? rval->client_ifindex : skb->ifindex;
         if (tx_ifindex != skb->ifindex)
-            inc_stat(STAT_REDIRECT);
+            TC_INC_STAT(STAT_REDIRECT);
         return tc_redirect_tx(tx_ifindex);
     }
 
@@ -651,10 +660,7 @@ int tc_relay_func(struct __sk_buff *skb)
         if (bpf_map_update_elem(&fwd_map, &fkey, &new_fval, BPF_NOEXIST) != 0)
         {
             bpf_map_delete_elem(&rev_map, &new_rkey);
-
-            fval = bpf_map_lookup_elem(&fwd_map, &fkey);
-            if (!fval)
-                RETURN_TC_OK();
+            RETURN_TC_OK();
         }
         else
         {
@@ -662,7 +668,7 @@ int tc_relay_func(struct __sk_buff *skb)
         }
     }
 
-    inc_stat(STAT_FORWARD_HIT);
+    TC_INC_STAT(STAT_FORWARD_HIT);
 
     __u32 old_saddr = iph->saddr;
     __u32 old_daddr = iph->daddr;
@@ -700,7 +706,7 @@ int tc_relay_func(struct __sk_buff *skb)
 
     __u32 tx_ifindex = fval->tx_ifindex ? fval->tx_ifindex : skb->ifindex;
     if (tx_ifindex != skb->ifindex)
-        inc_stat(STAT_REDIRECT);
+        TC_INC_STAT(STAT_REDIRECT);
     return tc_redirect_tx(tx_ifindex);
 }
 

@@ -84,6 +84,11 @@ make build
 sudo ./baozap
 ```
 
+低延迟路径（默认已启用）：
+
+- TC 路径不在热路径上做统计计数。
+- 并发建连 race 的 miss 分支采用更快的直接返回策略（减少一次 map lookup）。
+
 ## Docker Compose 部署
 
 `docker-compose.yaml`：
