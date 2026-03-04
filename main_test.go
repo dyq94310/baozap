@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -54,5 +56,16 @@ func TestIsXDPModeUnsupported(t *testing.T) {
 	}
 	if isXDPModeUnsupported(unix.EPERM) {
 		t.Fatal("did not expect EPERM to be unsupported")
+	}
+}
+
+func TestConfigDebugDefaultsToFalse(t *testing.T) {
+	raw := `{"rules":[{"relay_interface":"eth0","target_interface":"eth0","relay_port":9999,"target_ip":"127.0.0.1","target_port":11786}]}`
+	var conf Config
+	if err := json.NewDecoder(strings.NewReader(raw)).Decode(&conf); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if conf.Debug {
+		t.Fatal("expected debug default false when field is omitted")
 	}
 }

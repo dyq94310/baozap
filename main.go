@@ -105,7 +105,9 @@ func main() {
 	fmt.Printf("🛠  Debug Logging Enabled: %v\n", conf.Debug)
 
 	defer objs.Close()
-	defer dumpStatsMap(objs.StatsMap)
+	if conf.Debug {
+		defer dumpStatsMap(objs.StatsMap)
+	}
 
 	attachIfs := map[int]string{}
 	for _, rule := range conf.Rules {
