@@ -660,7 +660,12 @@ int tc_relay_func(struct __sk_buff *skb)
         if (bpf_map_update_elem(&fwd_map, &fkey, &new_fval, BPF_NOEXIST) != 0)
         {
             bpf_map_delete_elem(&rev_map, &new_rkey);
-            RETURN_TC_OK();
+
+            // Concurrent packet may have created fwd entry first.
+            // Reuse it instead of letting this packet fall back to kernel path.
+            fval = bpf_map_lookup_elem(&fwd_map, &fkey);
+            if (!fval)
+                RETURN_TC_OK();
         }
         else
         {

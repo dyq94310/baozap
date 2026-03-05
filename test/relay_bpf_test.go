@@ -225,6 +225,26 @@ func TestTCForwardAndReverseRewrite(t *testing.T) {
 		t.Fatalf("snat port out of range: %d", gotSrcPort)
 	}
 
+	// Replay the same flow to verify reuse path remains stable.
+	ret, secondForwardOut, err := objs.TcRelayFunc.Test(forwardIn)
+	if err != nil {
+		t.Fatalf("tc second forward test: %v", err)
+	}
+	if ret != tcRedirect {
+		t.Fatalf("second forward action = %d, want TC_ACT_REDIRECT(%d)", ret, tcRedirect)
+	}
+
+	_, _, secondSrcIP, secondDstIP, secondSrcPort, secondDstPort := decodeUDPPacket(t, secondForwardOut)
+	if secondSrcIP.String() != relayIP || secondDstIP.String() != targetIP {
+		t.Fatalf("second forward tuple ip = %s -> %s, want %s -> %s", secondSrcIP, secondDstIP, relayIP, targetIP)
+	}
+	if secondDstPort != targetPort {
+		t.Fatalf("second forward dst port = %d, want %d", secondDstPort, targetPort)
+	}
+	if secondSrcPort != gotSrcPort {
+		t.Fatalf("second forward snat port = %d, want %d", secondSrcPort, gotSrcPort)
+	}
+
 	reverseIn := buildUDPPacket(
 		targetMAC,
 		relayMAC,
@@ -606,4 +626,3 @@ func ipv4Checksum(hdr []byte) uint16 {
 	}
 	return ^uint16(sum)
 }
-
