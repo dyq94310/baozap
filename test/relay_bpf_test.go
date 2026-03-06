@@ -521,14 +521,11 @@ func writeRelayRule(m *ebpf.Map, relayPort uint16, relayIP, targetIP string, tar
 	key := make([]byte, 2)
 	binary.LittleEndian.PutUint16(key, htons(relayPort))
 
-	val := make([]byte, 30)
+	val := make([]byte, 16)
 	binary.LittleEndian.PutUint32(val[0:4], ip4ToU32LE(relayIP))
 	binary.LittleEndian.PutUint32(val[4:8], ip4ToU32LE(targetIP))
 	binary.LittleEndian.PutUint16(val[8:10], htons(targetPort))
-	copy(val[10:16], relayMAC[:])
-	copy(val[16:22], nextHopMAC[:])
-	binary.LittleEndian.PutUint32(val[22:26], relayIfindex)
-	binary.LittleEndian.PutUint32(val[26:30], txIfindex)
+	binary.LittleEndian.PutUint32(val[12:16], relayIfindex)
 
 	return m.Update(key, val, ebpf.UpdateAny)
 }

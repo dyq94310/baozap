@@ -12,7 +12,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -92,7 +91,7 @@ func main() {
 			continue
 		}
 
-		snatIP, outMAC, nextHopMAC, relayIfindex, txIfindex, err := probeNetwork(relayIf, targetIf, rule.TargetIP)
+		snatIP, relayIfindex, err := probeNetwork(relayIf, targetIf)
 		if err != nil {
 			fmt.Printf("⚠️ Skip rule %d: %v\n", rule.RelayPort, err)
 			continue
@@ -108,10 +107,7 @@ func main() {
 			snatIP,
 			tip,
 			htons(rule.TargetPort), // raw network-order uint16
-			outMAC,
-			nextHopMAC,
 			relayIfindex,
-			txIfindex,
 		)
 
 		portKey := htons(rule.RelayPort)
@@ -119,11 +115,9 @@ func main() {
 			log.Fatalf("Update map failed: %v", err)
 		}
 		fmt.Printf(
-			"✅ Added: %s/%s :%d -> %s:%d (relay_ifindex=%d tx_ifindex=%d out_mac=%s next_hop=%s)\n",
+			"✅ Added: %s/%s :%d -> %s:%d (relay_ifindex=%d)\n",
 			relayIf, targetIf, rule.RelayPort, rule.TargetIP, rule.TargetPort,
-			relayIfindex, txIfindex,
-			net.HardwareAddr(outMAC[:]).String(),
-			net.HardwareAddr(nextHopMAC[:]).String(),
+			relayIfindex,
 		)
 
 		if lnk, err := netlink.LinkByName(relayIf); err == nil && lnk.Attrs() != nil {
@@ -181,95 +175,40 @@ func isVersionFlagRequested() bool {
 	return false
 }
 
-func probeNetwork(relayIfaceName, targetIfaceName, targetIPStr string) (uint32, [6]byte, [6]byte, int, int, error) {
+func probeNetwork(relayIfaceName, targetIfaceName string) (uint32, int, error) {
 	relayLink, err := netlink.LinkByName(relayIfaceName)
 	if err != nil {
-		return 0, [6]byte{}, [6]byte{}, 0, 0, err
+		return 0, 0, err
 	}
 	targetLink, err := netlink.LinkByName(targetIfaceName)
 	if err != nil {
-		return 0, [6]byte{}, [6]byte{}, 0, 0, err
+		return 0, 0, err
 	}
 	if relayLink.Attrs() == nil || targetLink.Attrs() == nil {
-		return 0, [6]byte{}, [6]byte{}, 0, 0, fmt.Errorf("invalid interface attrs for %s/%s", relayIfaceName, targetIfaceName)
+		return 0, 0, fmt.Errorf("invalid interface attrs for %s/%s", relayIfaceName, targetIfaceName)
 	}
 
 	targetAddrs, err := netlink.AddrList(targetLink, netlink.FAMILY_V4)
 	if err != nil || len(targetAddrs) == 0 {
-		return 0, [6]byte{}, [6]byte{}, 0, 0, fmt.Errorf("no ipv4 addr on target interface %s", targetIfaceName)
+		return 0, 0, fmt.Errorf("no ipv4 addr on target interface %s", targetIfaceName)
 	}
-
-	var outMAC, nextHopMAC [6]byte
-	copy(outMAC[:], targetLink.Attrs().HardwareAddr)
 
 	snatIPv4 := targetAddrs[0].IP.To4()
 	if snatIPv4 == nil {
-		return 0, [6]byte{}, [6]byte{}, 0, 0, fmt.Errorf("invalid local ipv4 on target interface %s", targetIfaceName)
+		return 0, 0, fmt.Errorf("invalid local ipv4 on target interface %s", targetIfaceName)
 	}
 	snatIP := binary.LittleEndian.Uint32(snatIPv4)
 	relayIfindex := relayLink.Attrs().Index
-	txIfindex := targetLink.Attrs().Index
 
-	routes, err := netlink.RouteGet(net.ParseIP(targetIPStr))
-	if err != nil || len(routes) == 0 {
-		return 0, outMAC, nextHopMAC, relayIfindex, txIfindex, fmt.Errorf("no route to %s", targetIPStr)
-	}
-	if routes[0].LinkIndex != 0 {
-		txIfindex = routes[0].LinkIndex
-	}
-	if routes[0].LinkIndex != 0 && routes[0].LinkIndex != targetLink.Attrs().Index {
-		if routeIf, err := netlink.LinkByIndex(routes[0].LinkIndex); err == nil && routeIf.Attrs() != nil {
-			fmt.Printf(
-				"⚠️ Route mismatch: target %s route uses %s, configured target_interface is %s\n",
-				targetIPStr, routeIf.Attrs().Name, targetIfaceName,
-			)
-		} else {
-			fmt.Printf(
-				"⚠️ Route mismatch: target %s route uses ifindex=%d, configured target_interface is %s\n",
-				targetIPStr, routes[0].LinkIndex, targetIfaceName,
-			)
-		}
-	}
-
-	gw := routes[0].Gw
-	if gw == nil {
-		gw = net.ParseIP(targetIPStr)
-	}
-	gw = gw.To4()
-	if gw == nil {
-		return 0, outMAC, nextHopMAC, relayIfindex, txIfindex, fmt.Errorf("invalid gateway ip for %s", targetIPStr)
-	}
-	triggerIP := snatIPv4
-
-	for i := 0; i < 3; i++ {
-		neighs, _ := netlink.NeighList(targetLink.Attrs().Index, netlink.FAMILY_V4)
-		for _, n := range neighs {
-			if n.IP != nil && n.IP.Equal(gw) && n.HardwareAddr != nil {
-				copy(nextHopMAC[:], n.HardwareAddr)
-				return snatIP, outMAC, nextHopMAC, relayIfindex, txIfindex, nil
-			}
-		}
-
-		// 使用 UDP 报文触发内核邻居解析，避免依赖外部 ping 命令。
-		if conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: triggerIP}, &net.UDPAddr{IP: gw, Port: 9}); err == nil {
-			_, _ = conn.Write([]byte{0})
-			_ = conn.Close()
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	return snatIP, outMAC, outMAC, relayIfindex, txIfindex, fmt.Errorf("ARP not found for gateway %s on %s", gw, targetIfaceName)
+	return snatIP, relayIfindex, nil
 }
 
-func buildRelayRuleValue(relayIP, targetIP uint32, targetPort uint16, relayMAC, nextHopMAC [6]byte, relayIfindex, txIfindex int) []byte {
-	val := make([]byte, 30)
+func buildRelayRuleValue(relayIP, targetIP uint32, targetPort uint16, relayIfindex int) []byte {
+	val := make([]byte, 16)
 	binary.LittleEndian.PutUint32(val[0:4], relayIP)
 	binary.LittleEndian.PutUint32(val[4:8], targetIP)
 	binary.LittleEndian.PutUint16(val[8:10], targetPort)
-	copy(val[10:16], relayMAC[:])
-	copy(val[16:22], nextHopMAC[:])
-	binary.LittleEndian.PutUint32(val[22:26], uint32(relayIfindex))
-	binary.LittleEndian.PutUint32(val[26:30], uint32(txIfindex))
+	binary.LittleEndian.PutUint32(val[12:16], uint32(relayIfindex))
 	return val
 }
 
