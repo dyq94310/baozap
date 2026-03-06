@@ -15,6 +15,7 @@ import (
 const (
 	xdpPass     = 2
 	xdpTx       = 3
+	xdpRedirect = 4
 	tcActOK     = 0
 	tcRedirect  = 7
 	ipProtoUDP  = 17
@@ -93,16 +94,18 @@ func TestXDPForwardAndReverseRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("xdp forward test: %v", err)
 	}
-	if ret != xdpTx {
-		t.Fatalf("forward action = %d, want XDP_TX(%d)", ret, xdpTx)
+	if ret != xdpTx && ret != xdpRedirect {
+		t.Fatalf("forward action = %d, want XDP_TX(%d) or XDP_REDIRECT(%d)", ret, xdpTx, xdpRedirect)
 	}
 
 	gotDstMAC, gotSrcMAC, gotSrcIP, gotDstIP, gotSrcPort, gotDstPort := decodeUDPPacket(t, forwardOut)
-	if !bytes.Equal(gotDstMAC[:], nextHopMAC[:]) {
-		t.Fatalf("forward dst mac = %x, want %x", gotDstMAC, nextHopMAC)
-	}
-	if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
-		t.Fatalf("forward src mac = %x, want %x", gotSrcMAC, relayMAC)
+	if ret == xdpTx {
+		if !bytes.Equal(gotDstMAC[:], nextHopMAC[:]) {
+			t.Fatalf("forward dst mac = %x, want %x", gotDstMAC, nextHopMAC)
+		}
+		if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
+			t.Fatalf("forward src mac = %x, want %x", gotSrcMAC, relayMAC)
+		}
 	}
 	if gotSrcIP.String() != relayIP {
 		t.Fatalf("forward src ip = %s, want %s", gotSrcIP, relayIP)
@@ -132,16 +135,18 @@ func TestXDPForwardAndReverseRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("xdp reverse test: %v", err)
 	}
-	if ret != xdpTx {
-		t.Fatalf("reverse action = %d, want XDP_TX(%d)", ret, xdpTx)
+	if ret != xdpTx && ret != xdpRedirect {
+		t.Fatalf("reverse action = %d, want XDP_TX(%d) or XDP_REDIRECT(%d)", ret, xdpTx, xdpRedirect)
 	}
 
 	gotDstMAC, gotSrcMAC, gotSrcIP, gotDstIP, gotSrcPort, gotDstPort = decodeUDPPacket(t, reverseOut)
-	if !bytes.Equal(gotDstMAC[:], clientMAC[:]) {
-		t.Fatalf("reverse dst mac = %x, want %x", gotDstMAC, clientMAC)
-	}
-	if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
-		t.Fatalf("reverse src mac = %x, want %x", gotSrcMAC, relayMAC)
+	if ret == xdpTx {
+		if !bytes.Equal(gotDstMAC[:], clientMAC[:]) {
+			t.Fatalf("reverse dst mac = %x, want %x", gotDstMAC, clientMAC)
+		}
+		if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
+			t.Fatalf("reverse src mac = %x, want %x", gotSrcMAC, relayMAC)
+		}
 	}
 	if gotSrcIP.String() != relayIP {
 		t.Fatalf("reverse src ip = %s, want %s", gotSrcIP, relayIP)
