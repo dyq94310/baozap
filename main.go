@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -34,22 +33,6 @@ type Config struct {
 }
 
 var version = "dev"
-
-const (
-	statForwardHit = iota
-	statReverseHit
-	statRedirect
-	statPass
-	statDrop
-)
-
-var statNames = []string{
-	"forward_hit",
-	"reverse_hit",
-	"redirect",
-	"pass",
-	"drop",
-}
 
 /*
 * 约定
@@ -106,9 +89,6 @@ func main() {
 	fmt.Printf("🛠  Debug Logging Enabled: %v\n", conf.Debug)
 
 	defer objs.Close()
-	if conf.Debug {
-		defer dumpStatsMap(objs.StatsMap)
-	}
 
 	attachIfs := map[int]string{}
 	for _, rule := range conf.Rules {
@@ -418,33 +398,4 @@ func isXDPModeUnsupported(err error) bool {
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "operation not supported")
-}
-
-func dumpStatsMap(m *ebpf.Map) {
-	if m == nil {
-		fmt.Println("📊 XDP stats unavailable: stats_map is nil")
-		return
-	}
-	fmt.Println("📊 XDP stats:")
-	for i, name := range statNames {
-		key := uint32(i)
-		perCPU := make([]uint64, runtime.NumCPU())
-		if err := m.Lookup(&key, &perCPU); err == nil {
-			var total uint64
-			for _, v := range perCPU {
-				total += v
-			}
-			fmt.Printf("  - %s: %d\n", name, total)
-			continue
-		}
-
-		// Backward compatibility for non-percpu map objects.
-		var val uint64
-		if err := m.Lookup(&key, &val); err == nil {
-			fmt.Printf("  - %s: %d\n", name, val)
-			continue
-		}
-
-		fmt.Printf("  - %s: lookup error\n", name)
-	}
 }

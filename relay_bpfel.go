@@ -121,7 +121,6 @@ type relayMapSpecs struct {
 	ConfigMap *ebpf.MapSpec `ebpf:"config_map"`
 	FwdMap    *ebpf.MapSpec `ebpf:"fwd_map"`
 	RevMap    *ebpf.MapSpec `ebpf:"rev_map"`
-	StatsMap  *ebpf.MapSpec `ebpf:"stats_map"`
 }
 
 // relayVariableSpecs contains global variables before they are loaded into the kernel.
@@ -154,7 +153,6 @@ type relayMaps struct {
 	ConfigMap *ebpf.Map `ebpf:"config_map"`
 	FwdMap    *ebpf.Map `ebpf:"fwd_map"`
 	RevMap    *ebpf.Map `ebpf:"rev_map"`
-	StatsMap  *ebpf.Map `ebpf:"stats_map"`
 }
 
 func (m *relayMaps) Close() error {
@@ -162,7 +160,6 @@ func (m *relayMaps) Close() error {
 		m.ConfigMap,
 		m.FwdMap,
 		m.RevMap,
-		m.StatsMap,
 	)
 }
 

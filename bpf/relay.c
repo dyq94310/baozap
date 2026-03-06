@@ -24,24 +24,6 @@
 
 volatile const __u32 debug_enabled SEC(".data");
 
-enum stat_key
-{
-    STAT_FORWARD_HIT = 0,
-    STAT_REVERSE_HIT = 1,
-    STAT_REDIRECT = 2,
-    STAT_PASS = 3,
-    STAT_DROP = 4,
-    STAT_MAX = 5,
-};
-
-struct
-{
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, STAT_MAX);
-    __type(key, __u32);
-    __type(value, __u64);
-} stats_map SEC(".maps");
-
 // 定义一个宏，方便调用
 #define DEBUG_PRINTK(fmt, ...)              \
     do                                      \
@@ -50,21 +32,9 @@ struct
             bpf_printk(fmt, ##__VA_ARGS__); \
     } while (0)
 
-static __always_inline void inc_stat(__u32 k)
-{
-    // Keep the forwarding hot path minimal unless debug is explicitly enabled.
-    if (!debug_enabled)
-        return;
-
-    __u64 *v = bpf_map_lookup_elem(&stats_map, &k);
-    if (v)
-        (*v)++;
-}
-
 #define RETURN_PASS()        \
     do                       \
     {                        \
-        inc_stat(STAT_PASS); \
         return XDP_PASS;     \
     } while (0)
 
@@ -314,7 +284,6 @@ int xdp_relay_func(struct xdp_md *ctx)
     struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
     if (rval)
     {
-        inc_stat(STAT_REVERSE_HIT);
         DEBUG_PRINTK("DEBUG: Found Rev Map! NAT to Client %pI4:%d", &rval->client_ip, bpf_ntohs(rval->client_port));
         __u32 old_saddr = iph->saddr; // target
         __u32 old_daddr = iph->daddr; // snat_ip
@@ -356,7 +325,6 @@ int xdp_relay_func(struct xdp_md *ctx)
 
         if (rval->client_ifindex != 0 && rval->client_ifindex != ctx->ingress_ifindex)
         {
-            inc_stat(STAT_REDIRECT);
             return bpf_redirect(rval->client_ifindex, 0);
         }
         return XDP_TX;
@@ -445,7 +413,6 @@ int xdp_relay_func(struct xdp_md *ctx)
 
     // Now apply forward NAT using fval
     {
-        inc_stat(STAT_FORWARD_HIT);
         __u32 old_saddr = iph->saddr;    // client
         __u32 old_daddr = iph->daddr;    // vip
         __u32 new_saddr = fval->snat_ip; // relay ip
@@ -486,7 +453,6 @@ int xdp_relay_func(struct xdp_md *ctx)
 
         if (fval->tx_ifindex != 0 && fval->tx_ifindex != ctx->ingress_ifindex)
         {
-            inc_stat(STAT_REDIRECT);
             return bpf_redirect(fval->tx_ifindex, 0);
         }
         return XDP_TX;
@@ -494,15 +460,9 @@ int xdp_relay_func(struct xdp_md *ctx)
 }
 
 // TC clsact 版本：在 __sk_buff 上复用相同的 NAT 转发逻辑。
-#define TC_INC_STAT(k) \
-    do                 \
-    {                  \
-    } while (0)
-
 #define RETURN_TC_OK()       \
     do                       \
     {                        \
-        TC_INC_STAT(STAT_PASS); \
         return TC_ACT_OK;    \
     } while (0)
 
@@ -565,8 +525,6 @@ int tc_relay_func(struct __sk_buff *skb)
     struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
     if (rval)
     {
-        TC_INC_STAT(STAT_REVERSE_HIT);
-
         __u32 old_saddr = iph->saddr;
         __u32 old_daddr = iph->daddr;
         __u32 new_saddr = rval->vip;
@@ -602,8 +560,6 @@ int tc_relay_func(struct __sk_buff *skb)
         __builtin_memcpy(eth->h_source, rval->relay_mac, 6);
 
         __u32 tx_ifindex = rval->client_ifindex ? rval->client_ifindex : skb->ifindex;
-        if (tx_ifindex != skb->ifindex)
-            TC_INC_STAT(STAT_REDIRECT);
         return tc_redirect_tx(tx_ifindex);
     }
 
@@ -673,8 +629,6 @@ int tc_relay_func(struct __sk_buff *skb)
         }
     }
 
-    TC_INC_STAT(STAT_FORWARD_HIT);
-
     __u32 old_saddr = iph->saddr;
     __u32 old_daddr = iph->daddr;
     __u32 new_saddr = fval->snat_ip;
@@ -710,8 +664,6 @@ int tc_relay_func(struct __sk_buff *skb)
     __builtin_memcpy(eth->h_source, fval->relay_mac, 6);
 
     __u32 tx_ifindex = fval->tx_ifindex ? fval->tx_ifindex : skb->ifindex;
-    if (tx_ifindex != skb->ifindex)
-        TC_INC_STAT(STAT_REDIRECT);
     return tc_redirect_tx(tx_ifindex);
 }
 
