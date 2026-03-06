@@ -127,7 +127,6 @@ type relayMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type relayVariableSpecs struct {
-	DebugEnabled *ebpf.VariableSpec `ebpf:"debug_enabled"`
 }
 
 // relayObjects contains all objects after they have been loaded into the kernel.
@@ -167,7 +166,6 @@ func (m *relayMaps) Close() error {
 //
 // It can be passed to loadRelayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type relayVariables struct {
-	DebugEnabled *ebpf.Variable `ebpf:"debug_enabled"`
 }
 
 // relayPrograms contains all programs after they have been loaded into the kernel.
