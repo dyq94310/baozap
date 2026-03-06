@@ -197,6 +197,11 @@ static __always_inline int fib_redirect_xdp(struct xdp_md *ctx, struct ethhdr *e
                                             struct iphdr *iph, __u8 proto,
                                             __u16 sport, __u16 dport)
 {
+    // Program.Test() may provide zero ifindex and inconsistent FIB context.
+    // Skip FIB in that case to keep behavior deterministic in tests.
+    if (ctx->ingress_ifindex == 0)
+        return -1;
+
     struct bpf_fib_lookup fib = {};
     fib.family = AF_INET;
     fib.ifindex = ctx->ingress_ifindex;
@@ -226,6 +231,10 @@ static __always_inline int fib_redirect_tc(struct __sk_buff *skb, struct ethhdr 
                                            struct iphdr *iph, __u8 proto,
                                            __u16 sport, __u16 dport)
 {
+    // Program.Test() may provide zero ifindex and inconsistent FIB context.
+    if (skb->ifindex == 0)
+        return -1;
+
     struct bpf_fib_lookup fib = {};
     fib.family = AF_INET;
     fib.ifindex = skb->ifindex;
