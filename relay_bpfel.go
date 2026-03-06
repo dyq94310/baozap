@@ -30,6 +30,9 @@ type relayFwdVal struct {
 	TargetIp   uint32
 	TargetPort uint16
 	SnatPort   uint16
+	RelayMac   [6]uint8
+	NextHopMac [6]uint8
+	TxIfindex  uint32
 }
 
 type relayRelayRule struct {
@@ -37,8 +40,10 @@ type relayRelayRule struct {
 	RelayIp      uint32
 	TargetIp     uint32
 	TargetPort   uint16
-	Pad          uint16
+	RelayMac     [6]uint8
+	NextHopMac   [6]uint8
 	RelayIfindex uint32
+	TxIfindex    uint32
 }
 
 type relayRevKey struct {
@@ -53,11 +58,14 @@ type relayRevKey struct {
 }
 
 type relayRevVal struct {
-	_           structs.HostLayout
-	ClientIp    uint32
-	ClientPort  uint16
-	ServicePort uint16
-	Vip         uint32
+	_             structs.HostLayout
+	ClientIp      uint32
+	ClientPort    uint16
+	ServicePort   uint16
+	Vip           uint32
+	ClientMac     [6]uint8
+	RelayMac      [6]uint8
+	ClientIfindex uint32
 }
 
 // loadRelay returns the embedded CollectionSpec for relay.

@@ -36,8 +36,10 @@ struct relay_rule
     __u32 relay_ip;    // raw (little-endian u32 from packet field)
     __u32 target_ip;   // raw
     __u16 target_port; // network order (raw like tcp/udp header field)
-    __u16 pad;
+    unsigned char relay_mac[6];
+    unsigned char next_hop_mac[6];
     __u32 relay_ifindex; // ingress ifindex for client->relay traffic
+    __u32 tx_ifindex; // egress ifindex for forward path (0 => lookup route)
 } __attribute__((packed));
 
 // Key: relay service port (network order raw)
@@ -68,6 +70,9 @@ struct fwd_val
     __u32 target_ip;   // raw
     __u16 target_port; // raw
     __u16 snat_port;   // raw (allocated)
+    unsigned char relay_mac[6];
+    unsigned char next_hop_mac[6];
+    __u32 tx_ifindex; // optional fallback egress ifindex
 };
 
 // reverse key: (snat_ip, target_ip, target_port, snat_port, proto)
@@ -85,10 +90,13 @@ struct rev_key
 // reverse value: who is the client + what service_port to show to client
 struct rev_val
 {
-    __u32 client_ip;   // raw
-    __u16 client_port; // raw
-    __u16 service_port;
-    __u32 vip;
+    __u32 client_ip;    // raw
+    __u16 client_port;  // raw
+    __u16 service_port; // raw (client sees src port as this)
+    __u32 vip;          // original destination ip from client packet
+    unsigned char client_mac[6];
+    unsigned char relay_mac[6];
+    __u32 client_ifindex; // optional fallback ifindex
 };
 
 // LRU: UDP 没有 close，必须 LRU
@@ -211,7 +219,7 @@ static __always_inline int fib_redirect_xdp(struct xdp_md *ctx, struct ethhdr *e
     }
     if (rc == BPF_FIB_LKUP_RET_BLACKHOLE || rc == BPF_FIB_LKUP_RET_UNREACHABLE || rc == BPF_FIB_LKUP_RET_PROHIBIT)
         return XDP_DROP;
-    return XDP_PASS;
+    return -1;
 }
 
 static __always_inline int fib_redirect_tc(struct __sk_buff *skb, struct ethhdr *eth,
@@ -238,7 +246,7 @@ static __always_inline int fib_redirect_tc(struct __sk_buff *skb, struct ethhdr 
     }
     if (rc == BPF_FIB_LKUP_RET_BLACKHOLE || rc == BPF_FIB_LKUP_RET_UNREACHABLE || rc == BPF_FIB_LKUP_RET_PROHIBIT)
         return TC_ACT_SHOT;
-    return TC_ACT_OK;
+    return -1;
 }
 
 SEC("xdp")
@@ -328,7 +336,15 @@ int xdp_relay_func(struct xdp_md *ctx)
             iph->daddr = new_daddr;
             *sportp = new_sport;
             *dportp = new_dport;
-            return fib_redirect_xdp(ctx, eth, iph, proto, *sportp, *dportp);
+            int act = fib_redirect_xdp(ctx, eth, iph, proto, *sportp, *dportp);
+            if (act >= 0)
+                return act;
+
+            __builtin_memcpy(eth->h_dest, rval->client_mac, 6);
+            __builtin_memcpy(eth->h_source, rval->relay_mac, 6);
+            if (rval->client_ifindex != 0 && rval->client_ifindex != ctx->ingress_ifindex)
+                return bpf_redirect(rval->client_ifindex, 0);
+            return XDP_TX;
         }
     }
 
@@ -364,7 +380,10 @@ int xdp_relay_func(struct xdp_md *ctx)
             .client_port = sport,
             .service_port = dport,
             .vip = iph->daddr,
+            .client_ifindex = ctx->ingress_ifindex,
         };
+        __builtin_memcpy(new_rval.client_mac, eth->h_source, 6);
+        __builtin_memcpy(new_rval.relay_mac, eth->h_dest, 6);
 
         __u16 snat_port = alloc_snat_port(bpf_get_prandom_u32(), &new_rkey, &new_rval);
         if (snat_port == 0)
@@ -374,6 +393,9 @@ int xdp_relay_func(struct xdp_md *ctx)
         new_fval.target_ip = rule->target_ip;
         new_fval.target_port = rule->target_port;
         new_fval.snat_port = snat_port;
+        __builtin_memcpy(new_fval.relay_mac, rule->relay_mac, 6);
+        __builtin_memcpy(new_fval.next_hop_mac, rule->next_hop_mac, 6);
+        new_fval.tx_ifindex = rule->tx_ifindex;
 
         if (bpf_map_update_elem(&fwd_map, &fkey, &new_fval, BPF_NOEXIST) != 0)
         {
@@ -422,7 +444,15 @@ int xdp_relay_func(struct xdp_md *ctx)
         iph->daddr = new_daddr;
         *sportp = new_sport;
         *dportp = new_dport;
-        return fib_redirect_xdp(ctx, eth, iph, proto, *sportp, *dportp);
+        int act = fib_redirect_xdp(ctx, eth, iph, proto, *sportp, *dportp);
+        if (act >= 0)
+            return act;
+
+        __builtin_memcpy(eth->h_dest, fval->next_hop_mac, 6);
+        __builtin_memcpy(eth->h_source, fval->relay_mac, 6);
+        if (fval->tx_ifindex != 0 && fval->tx_ifindex != ctx->ingress_ifindex)
+            return bpf_redirect(fval->tx_ifindex, 0);
+        return XDP_TX;
     }
 }
 
@@ -520,7 +550,14 @@ int tc_relay_func(struct __sk_buff *skb)
             iph->daddr = new_daddr;
             *sportp = new_sport;
             *dportp = new_dport;
-            return fib_redirect_tc(skb, eth, iph, proto, *sportp, *dportp);
+            int act = fib_redirect_tc(skb, eth, iph, proto, *sportp, *dportp);
+            if (act >= 0)
+                return act;
+
+            __builtin_memcpy(eth->h_dest, rval->client_mac, 6);
+            __builtin_memcpy(eth->h_source, rval->relay_mac, 6);
+            __u32 tx_ifindex = rval->client_ifindex ? rval->client_ifindex : skb->ifindex;
+            return bpf_redirect(tx_ifindex, 0);
         }
     }
 
@@ -557,7 +594,10 @@ int tc_relay_func(struct __sk_buff *skb)
             .client_port = sport,
             .service_port = dport,
             .vip = iph->daddr,
+            .client_ifindex = skb->ifindex,
         };
+        __builtin_memcpy(new_rval.client_mac, eth->h_source, 6);
+        __builtin_memcpy(new_rval.relay_mac, eth->h_dest, 6);
 
         __u16 snat_port = alloc_snat_port(bpf_get_prandom_u32(), &new_rkey, &new_rval);
         if (snat_port == 0)
@@ -567,6 +607,9 @@ int tc_relay_func(struct __sk_buff *skb)
         new_fval.target_ip = rule->target_ip;
         new_fval.target_port = rule->target_port;
         new_fval.snat_port = snat_port;
+        __builtin_memcpy(new_fval.relay_mac, rule->relay_mac, 6);
+        __builtin_memcpy(new_fval.next_hop_mac, rule->next_hop_mac, 6);
+        new_fval.tx_ifindex = rule->tx_ifindex;
 
         if (bpf_map_update_elem(&fwd_map, &fkey, &new_fval, BPF_NOEXIST) != 0)
         {
@@ -614,7 +657,14 @@ int tc_relay_func(struct __sk_buff *skb)
     iph->daddr = new_daddr;
     *sportp = new_sport;
     *dportp = new_dport;
-    return fib_redirect_tc(skb, eth, iph, proto, *sportp, *dportp);
+    int act = fib_redirect_tc(skb, eth, iph, proto, *sportp, *dportp);
+    if (act >= 0)
+        return act;
+
+    __builtin_memcpy(eth->h_dest, fval->next_hop_mac, 6);
+    __builtin_memcpy(eth->h_source, fval->relay_mac, 6);
+    __u32 tx_ifindex = fval->tx_ifindex ? fval->tx_ifindex : skb->ifindex;
+    return bpf_redirect(tx_ifindex, 0);
 }
 
 char _license[] SEC("license") = "GPL";

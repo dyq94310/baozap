@@ -107,7 +107,10 @@ func main() {
 			snatIP,
 			tip,
 			htons(rule.TargetPort), // raw network-order uint16
+			[6]byte{},
+			[6]byte{},
 			relayIfindex,
+			0,
 		)
 
 		portKey := htons(rule.RelayPort)
@@ -203,12 +206,15 @@ func probeNetwork(relayIfaceName, targetIfaceName string) (uint32, int, error) {
 	return snatIP, relayIfindex, nil
 }
 
-func buildRelayRuleValue(relayIP, targetIP uint32, targetPort uint16, relayIfindex int) []byte {
-	val := make([]byte, 16)
+func buildRelayRuleValue(relayIP, targetIP uint32, targetPort uint16, relayMAC, nextHopMAC [6]byte, relayIfindex, txIfindex int) []byte {
+	val := make([]byte, 30)
 	binary.LittleEndian.PutUint32(val[0:4], relayIP)
 	binary.LittleEndian.PutUint32(val[4:8], targetIP)
 	binary.LittleEndian.PutUint16(val[8:10], targetPort)
-	binary.LittleEndian.PutUint32(val[12:16], uint32(relayIfindex))
+	copy(val[10:16], relayMAC[:])
+	copy(val[16:22], nextHopMAC[:])
+	binary.LittleEndian.PutUint32(val[22:26], uint32(relayIfindex))
+	binary.LittleEndian.PutUint32(val[26:30], uint32(txIfindex))
 	return val
 }
 
