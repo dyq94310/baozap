@@ -21,15 +21,24 @@ import (
 )
 
 type Config struct {
-	Mode  string `json:"mode"`  // "xdp" or "tc"
-	Debug bool   `json:"debug"` // JSON 中不写则默认为 false
-	Rules []struct {
-		RelayInterface  string `json:"relay_interface"`
-		TargetInterface string `json:"target_interface"`
-		RelayPort       uint16 `json:"relay_port"`
-		TargetIP        string `json:"target_ip"`
-		TargetPort      uint16 `json:"target_port"`
-	} `json:"rules"`
+	Mode  string       `json:"mode"`  // "xdp" or "tc"
+	Debug bool         `json:"debug"` // JSON 中不写则默认为 false
+	Rules []RuleConfig `json:"rules"`
+}
+
+type RuleConfig struct {
+	Mode            string `json:"mode"` // "xdp" or "tc"
+	RelayInterface  string `json:"relay_interface"`
+	TargetInterface string `json:"target_interface"`
+	RelayPort       uint16 `json:"relay_port"`
+	TargetIP        string `json:"target_ip"`
+	TargetPort      uint16 `json:"target_port"`
+}
+
+type attachPlan struct {
+	ifName string
+	tc     bool
+	xdp    bool
 }
 
 var version = "dev"
@@ -80,8 +89,18 @@ func main() {
 
 	defer objs.Close()
 
-	attachIfs := map[int]string{}
+	defaultMode, err := normalizeMode(conf.Mode, "tc")
+	if err != nil {
+		log.Fatalf("invalid top-level mode: %v", err)
+	}
+
+	attachIfs := map[int]*attachPlan{}
 	for _, rule := range conf.Rules {
+		ruleMode, err := normalizeMode(rule.Mode, defaultMode)
+		if err != nil {
+			log.Fatalf("invalid mode for relay_port %d: %v", rule.RelayPort, err)
+		}
+
 		relayIf := rule.RelayInterface
 		targetIf := rule.TargetInterface
 		if targetIf == "" {
@@ -126,33 +145,27 @@ func main() {
 			net.HardwareAddr(nextHopMAC[:]).String(),
 		)
 
-		if lnk, err := netlink.LinkByName(relayIf); err == nil && lnk.Attrs() != nil {
-			attachIfs[lnk.Attrs().Index] = relayIf
-		}
-		if lnk, err := netlink.LinkByName(targetIf); err == nil && lnk.Attrs() != nil {
-			attachIfs[lnk.Attrs().Index] = targetIf
-		}
+		planInterfaceMode(attachIfs, relayIf, ruleMode)
+		planInterfaceMode(attachIfs, targetIf, ruleMode)
 	}
 
 	if len(attachIfs) == 0 {
 		log.Fatalf("no valid rules loaded; nothing to attach")
 	}
 
-	mode := strings.ToLower(conf.Mode)
-	if mode == "" {
-		mode = "tc"
-	}
-
 	var links []io.Closer
-	for ifidx, ifname := range attachIfs {
-		if mode == "tc" {
+	for ifidx, plan := range attachIfs {
+		if plan.tc {
+			ifname := plan.ifName
 			l, err := attachTCIngress(objs.TcRelayFunc, ifidx, ifname)
 			if err != nil {
 				log.Fatalf("Attach TC on %s(%d): %v", ifname, ifidx, err)
 			}
 			links = append(links, l)
 			fmt.Printf("🚀 TC program attached to interface %s (hook=clsact/ingress)\n", ifname)
-		} else {
+		}
+		if plan.xdp {
+			ifname := plan.ifName
 			l, xdpMode, err := attachXDPWithFallback(objs.XdpRelayFunc, ifidx, ifname)
 			if err != nil {
 				log.Fatalf("Attach XDP on %s(%d): %v", ifname, ifidx, err)
@@ -170,6 +183,44 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
+}
+
+func normalizeMode(mode, fallback string) (string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = strings.ToLower(strings.TrimSpace(fallback))
+	}
+	if mode == "" {
+		mode = "tc"
+	}
+	switch mode {
+	case "tc", "xdp":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported mode %q", mode)
+	}
+}
+
+func planInterfaceMode(plans map[int]*attachPlan, ifName, mode string) {
+	lnk, err := netlink.LinkByName(ifName)
+	if err != nil || lnk.Attrs() == nil {
+		return
+	}
+	mergeAttachMode(plans, lnk.Attrs().Index, ifName, mode)
+}
+
+func mergeAttachMode(plans map[int]*attachPlan, ifIndex int, ifName, mode string) {
+	plan := plans[ifIndex]
+	if plan == nil {
+		plan = &attachPlan{ifName: ifName}
+		plans[ifIndex] = plan
+	}
+	switch mode {
+	case "tc":
+		plan.tc = true
+	case "xdp":
+		plan.xdp = true
+	}
 }
 
 func isVersionFlagRequested() bool {

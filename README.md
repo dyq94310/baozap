@@ -27,7 +27,7 @@
 
 ## 配置示例
 
-`config.json`（默认使用 TC eBPF，在不升级内核的前提下对 GRO/TSO 更友好）：
+`config.json`（默认使用 TC eBPF，在不升级内核的前提下对 GRO/TSO 更友好；也支持按端口覆盖 mode）：
 
 ```json
 {
@@ -35,6 +35,7 @@
   "debug": false,
   "rules": [
     {
+      "mode": "xdp",
       "relay_interface": "eth0",
       "target_interface": "eth0",
       "relay_port": 9999,
@@ -47,13 +48,14 @@
 
 字段说明：
 
+- `mode`: 顶层默认挂载模式，可选，`"tc"`（默认，使用 TC eBPF，GRO/TSO 兼容性更好，内核 < 6.6 时自动使用传统 tc-bpf 注入）或 `"xdp"`（纯 XDP，性能更高但对 offload 更敏感）
 - `debug`: 是否开启内核日志
+- `rules[].mode`: 可选，单端口覆盖顶层 `mode`
 - `rules[].relay_interface`: 收入流量（Client -> Relay）的接口
 - `rules[].target_interface`: 发往目标与接收回包（Relay <-> Target）的接口
 - `rules[].relay_port`: 中继端口
 - `rules[].target_ip`: 目标 IPv4
 - `rules[].target_port`: 目标端口
- - `mode`: 可选，`"tc"`（默认，使用 TC eBPF，GRO/TSO 兼容性更好，内核 < 6.6 时自动使用传统 tc-bpf 注入）或 `"xdp"`（纯 XDP，性能更高但对 offload 更敏感）
 
 ## 二进制部署（推荐）
 

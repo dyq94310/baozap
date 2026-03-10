@@ -1,19 +1,22 @@
 {
-    "debug": false,
-    "rules": [
-        {
-            "relay_interface": "wlp2s0",
-            "target_interface": "wlp2s0",
-            "relay_port": 9999,
-            "target_ip": "161.248.136.126",
-            "target_port": 11786
-        },
-        {
-            "relay_interface": "wlp2s0",
-            "target_interface": "wlp2s0",
-            "relay_port": 9998,
-            "target_ip": "161.248.136.126",
-            "target_port": 11782
-        }
-    ]
+  "mode": "tc",
+  "debug": false,
+  "rules": [
+    {
+      "mode": "tc",
+      "relay_interface": "wlp2s0",
+      "target_interface": "wlp2s0",
+      "relay_port": 9999,
+      "target_ip": "161.248.136.126",
+      "target_port": 11786
+    },
+    {
+      "mode": "xdp",
+      "relay_interface": "wlp2s0",
+      "target_interface": "wlp2s0",
+      "relay_port": 9998,
+      "target_ip": "161.248.136.126",
+      "target_port": 11782
+    }
+  ]
 }
