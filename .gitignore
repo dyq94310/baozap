@@ -8,3 +8,4 @@ baozap
 # 开发工具产物
 .vscode/
 .idea/
+.aider*

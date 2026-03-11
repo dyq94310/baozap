@@ -28,150 +28,144 @@
         return XDP_PASS;     \
     } while (0)
 
-struct relay_rule
-{
-    __u32 relay_ip;    // raw (little-endian u32 from packet field)
-    __u32 target_ip;   // raw
-    __u16 target_port; // network order (raw like tcp/udp header field)
-    unsigned char relay_mac[6];
-    unsigned char next_hop_mac[6];
-    __u32 relay_ifindex; // ingress ifindex for client->relay traffic
-    __u32 tx_ifindex; // egress ifindex for forward path (0 => XDP_TX)
-} __attribute__((packed));
+struct relay_rule {
+	__u32 relay_ip;    // raw (little-endian u32 from packet field)
+	__u32 target_ip;   // raw
+	__u16 target_port; // network order (raw like tcp/udp header field)
+	__u8 relay_mac[6];
+	__u8 next_hop_mac[6];
+	__u16 pad;           // alignment padding to match Go's structs.HostLayout
+	__u32 relay_ifindex; // ingress ifindex for client->relay traffic
+	__u32 tx_ifindex;    // egress ifindex for forward path (0 => XDP_TX)
+};
 
 // Key: relay service port (network order raw)
-struct
-{
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
-    __type(key, __u16);
-    __type(value, struct relay_rule);
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, __u16);
+	__type(value, struct relay_rule);
 } config_map SEC(".maps");
 
 // forward key: (vip, service_port, client_ip, client_port, proto)
-struct fwd_key
-{
-    __u32 vip;          // iph->daddr (raw)
-    __u32 client_ip;    // iph->saddr (raw)
-    __u16 service_port; // original dport (raw)
-    __u16 client_port;  // original sport (raw)
-    __u8 proto;         // TCP/UDP
-    __u8 pad1;
-    __u16 pad2;
+struct fwd_key {
+	__u32 vip;	    // iph->daddr (raw)
+	__u32 client_ip;    // iph->saddr (raw)
+	__u16 service_port; // original dport (raw)
+	__u16 client_port;  // original sport (raw)
+	__u8 proto;	    // TCP/UDP
+	__u8 pad1;
+	__u16 pad2;
 };
 
 // forward value: resolved target + chosen snat_port + L2 data
-struct fwd_val
-{
-    __u32 snat_ip;     // relay_ip (raw)
-    __u32 target_ip;   // raw
-    __u16 target_port; // raw
-    __u16 snat_port;   // raw (allocated)
-    unsigned char relay_mac[6];
-    unsigned char next_hop_mac[6];
-    __u32 tx_ifindex; // 0 => XDP_TX, otherwise redirect to this ifindex
+struct fwd_val {
+	__u32 snat_ip;	   // relay_ip (raw)
+	__u32 target_ip;   // raw
+	__u16 target_port; // raw
+	__u16 snat_port;   // raw (allocated)
+	__u8 relay_mac[6];
+	__u8 next_hop_mac[6];
+	__u32 tx_ifindex; // 0 => XDP_TX, otherwise redirect to this ifindex
 };
 
 // reverse key: (snat_ip, target_ip, target_port, snat_port, proto)
-struct rev_key
-{
-    __u32 snat_ip;     // iph->daddr on return path (raw)
-    __u32 target_ip;   // iph->saddr on return path (raw)
-    __u16 target_port; // sport on return path (raw)
-    __u16 snat_port;   // dport on return path (raw)
-    __u8 proto;
-    __u8 pad1;
-    __u16 pad2;
+struct rev_key {
+	__u32 snat_ip;	   // iph->daddr on return path (raw)
+	__u32 target_ip;   // iph->saddr on return path (raw)
+	__u16 target_port; // sport on return path (raw)
+	__u16 snat_port;   // dport on return path (raw)
+	__u8 proto;
+	__u8 pad1;
+	__u16 pad2;
 };
 
 // reverse value: who is the client + what service_port to show to client
-struct rev_val
-{
-    __u32 client_ip;    // raw
-    __u16 client_port;  // raw
-    __u16 service_port; // raw (client sees src port as this)
-    __u32 vip;          // original destination ip from client packet
-    unsigned char client_mac[6];
-    unsigned char relay_mac[6]; // relay MAC observed by client on ingress
-    __u32 client_ifindex;       // ingress ifindex for return redirect
+struct rev_val {
+	__u32 client_ip;    // raw
+	__u16 client_port;  // raw
+	__u16 service_port; // raw (client sees src port as this)
+	__u32 vip;	    // original destination ip from client packet
+	__u8 client_mac[6];
+	__u8 relay_mac[6];    // relay MAC observed by client on ingress
+	__u32 client_ifindex; // ingress ifindex for return redirect
 };
 
 // LRU: UDP 没有 close，必须 LRU
-struct
-{
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 4096);
-    __type(key, struct fwd_key);
-    __type(value, struct fwd_val);
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct fwd_key);
+	__type(value, struct fwd_val);
 } fwd_map SEC(".maps");
 
-struct
-{
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 4096);
-    __type(key, struct rev_key);
-    __type(value, struct rev_val);
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct rev_key);
+	__type(value, struct rev_val);
 } rev_map SEC(".maps");
 
 // RFC1624 incremental checksum update
-static __always_inline void update_csum(__u16 *csum, __u16 old_val, __u16 new_val)
+static inline __attribute__((always_inline)) void update_csum(__u16 *csum, __u16 old_val, __u16 new_val)
 {
     __u32 sum = *csum;
     sum = ~sum & 0xFFFF;
     sum += ~old_val & 0xFFFF;
     sum += new_val;
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
     *csum = ~sum & 0xFFFF;
 }
 
-// UDP/IPv4: checksum=0 means "no checksum" => skip update.
-// If old != 0 and updated becomes 0, must set to 0xFFFF.
-static __always_inline void l4_csum_replace16(__u8 proto, __u16 *csum, __u16 old_val, __u16 new_val)
+static inline __attribute__((always_inline)) void update_csum32(__u16 *csum, __u32 old_val, __u32 new_val)
 {
-    if (proto == IPPROTO_UDP && *csum == 0)
-        return;
-    update_csum(csum, old_val, new_val);
+    update_csum(csum, (__u16)(old_val & 0xFFFF), (__u16)(new_val & 0xFFFF));
+    update_csum(csum, (__u16)(old_val >> 16), (__u16)(new_val >> 16));
 }
 
-static __always_inline void udp_csum_fixup_zero(__u8 proto, __u16 *csum, __u16 old_csum)
+static inline __attribute__((always_inline)) void l4_csum_fixup_zero(__u8 proto, __u16 *csum, __u16 old_csum)
 {
-    if (proto == IPPROTO_UDP && old_csum != 0 && *csum == 0)
+    if (proto == IPPROTO_UDP && old_csum == 0)
+        return;
+    if (*csum == 0)
         *csum = 0xFFFF;
 }
 
-static __always_inline int parse_l4(void *l4, void *data_end, __u8 proto,
-                                    __u16 **sportp, __u16 **dportp, __u16 **checkp,
-                                    struct tcphdr **tcph_out)
+static inline __attribute__((always_inline)) void ip_csum_fixup_zero(__u16 *csum)
 {
+    if (*csum == 0)
+        *csum = 0xFFFF;
+}
+
+static inline __attribute__((always_inline)) int parse_l4(void *l4, void *data_end, __u8 proto,
+                                                         __u16 **sportp, __u16 **dportp, __u16 **checkp)
+{
+    if ((void *)((char *)l4 + 4) > data_end)
+        return -1;
+
+    struct udphdr *any_l4 = l4;
+    *sportp = &any_l4->source;
+    *dportp = &any_l4->dest;
+
     if (proto == IPPROTO_TCP)
     {
         struct tcphdr *tcp = l4;
         if ((void *)(tcp + 1) > data_end)
             return -1;
-        *sportp = &tcp->source;
-        *dportp = &tcp->dest;
         *checkp = &tcp->check;
-        if (tcph_out)
-            *tcph_out = tcp;
-        return 0;
     }
-    if (proto == IPPROTO_UDP)
+    else
     {
         struct udphdr *udp = l4;
         if ((void *)(udp + 1) > data_end)
             return -1;
-        *sportp = &udp->source;
-        *dportp = &udp->dest;
         *checkp = &udp->check;
-        if (tcph_out)
-            *tcph_out = 0;
-        return 0;
     }
-    return -1;
+    return 0;
 }
 
-static __always_inline __u16 alloc_snat_port(__u32 seed, struct rev_key *rkey, struct rev_val *rval)
+static inline __attribute__((always_inline)) __u16 alloc_snat_port(__u32 seed, struct rev_key *rkey, struct rev_val *rval)
 {
 #pragma unroll
     for (int i = 0; i < SNAT_TRIES; i++)
@@ -226,8 +220,7 @@ int xdp_relay_func(struct xdp_md *ctx)
         RETURN_PASS();
 
     __u16 *sportp = 0, *dportp = 0, *checkp = 0;
-    struct tcphdr *tcph = 0;
-    if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp, &tcph) < 0)
+    if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp) < 0)
         RETURN_PASS();
 
     __u16 sport = *sportp;
@@ -259,19 +252,18 @@ int xdp_relay_func(struct xdp_md *ctx)
 
             __u16 old_l4_csum = *checkp;
 
-            l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
-            l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
-            l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
-            l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+            if (!(proto == IPPROTO_UDP && old_l4_csum == 0))
+            {
+                update_csum32(checkp, old_saddr, new_saddr);
+                update_csum32(checkp, old_daddr, new_daddr);
+                update_csum(checkp, old_sport, new_sport);
+                update_csum(checkp, old_dport, new_dport);
+                l4_csum_fixup_zero(proto, checkp, old_l4_csum);
+            }
 
-            l4_csum_replace16(proto, checkp, old_sport, new_sport);
-            l4_csum_replace16(proto, checkp, old_dport, new_dport);
-            udp_csum_fixup_zero(proto, checkp, old_l4_csum);
-
-            update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
-            update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
-            update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
-            update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+            update_csum32(&iph->check, old_saddr, new_saddr);
+            update_csum32(&iph->check, old_daddr, new_daddr);
+            ip_csum_fixup_zero(&iph->check);
 
             iph->saddr = new_saddr;
             iph->daddr = new_daddr;
@@ -298,7 +290,7 @@ int xdp_relay_func(struct xdp_md *ctx)
     };
 
     struct fwd_val *fval = bpf_map_lookup_elem(&fwd_map, &fkey);
-    struct fwd_val new_fval;
+    struct fwd_val new_fval = {};
 
     if (!fval)
     {
@@ -342,6 +334,8 @@ int xdp_relay_func(struct xdp_md *ctx)
         {
             bpf_map_delete_elem(&rev_map, &new_rkey);
 
+            // Concurrent packet may have created fwd entry first.
+            // Reuse it instead of letting this packet fall back to kernel path.
             fval = bpf_map_lookup_elem(&fwd_map, &fkey);
             if (!fval)
                 RETURN_PASS();
@@ -365,20 +359,19 @@ int xdp_relay_func(struct xdp_md *ctx)
         __u16 old_l4_csum = *checkp;
 
         // L4 checksum updates: pseudo header + ports
-        l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
-        l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
-        l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
-        l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
-
-        l4_csum_replace16(proto, checkp, old_sport, new_sport);
-        l4_csum_replace16(proto, checkp, old_dport, new_dport);
-        udp_csum_fixup_zero(proto, checkp, old_l4_csum);
+        if (!(proto == IPPROTO_UDP && old_l4_csum == 0))
+        {
+            update_csum32(checkp, old_saddr, new_saddr);
+            update_csum32(checkp, old_daddr, new_daddr);
+            update_csum(checkp, old_sport, new_sport);
+            update_csum(checkp, old_dport, new_dport);
+            l4_csum_fixup_zero(proto, checkp, old_l4_csum);
+        }
 
         // IP header checksum updates
-        update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
-        update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
-        update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
-        update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+        update_csum32(&iph->check, old_saddr, new_saddr);
+        update_csum32(&iph->check, old_daddr, new_daddr);
+        ip_csum_fixup_zero(&iph->check);
 
         // write back
         iph->saddr = new_saddr;
@@ -405,12 +398,12 @@ int xdp_relay_func(struct xdp_md *ctx)
         return TC_ACT_OK;    \
     } while (0)
 
-static __always_inline int tc_redirect_tx(__u32 ifindex)
+static inline __attribute__((always_inline)) int tc_redirect_tx(__u32 ifindex)
 {
     return bpf_redirect(ifindex, 0);
 }
 
-SEC("tc")
+SEC("classifier")
 int tc_relay_func(struct __sk_buff *skb)
 {
     void *data_end = (void *)(long)skb->data_end;
@@ -446,8 +439,7 @@ int tc_relay_func(struct __sk_buff *skb)
         RETURN_TC_OK();
 
     __u16 *sportp = 0, *dportp = 0, *checkp = 0;
-    struct tcphdr *tcph = 0;
-    if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp, &tcph) < 0)
+    if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp) < 0)
         RETURN_TC_OK();
 
     __u16 sport = *sportp;
@@ -479,19 +471,18 @@ int tc_relay_func(struct __sk_buff *skb)
 
             __u16 old_l4_csum = *checkp;
 
-            l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
-            l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
-            l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
-            l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+            if (!(proto == IPPROTO_UDP && old_l4_csum == 0))
+            {
+                update_csum32(checkp, old_saddr, new_saddr);
+                update_csum32(checkp, old_daddr, new_daddr);
+                update_csum(checkp, old_sport, new_sport);
+                update_csum(checkp, old_dport, new_dport);
+                l4_csum_fixup_zero(proto, checkp, old_l4_csum);
+            }
 
-            l4_csum_replace16(proto, checkp, old_sport, new_sport);
-            l4_csum_replace16(proto, checkp, old_dport, new_dport);
-            udp_csum_fixup_zero(proto, checkp, old_l4_csum);
-
-            update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
-            update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
-            update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
-            update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+            update_csum32(&iph->check, old_saddr, new_saddr);
+            update_csum32(&iph->check, old_daddr, new_daddr);
+            ip_csum_fixup_zero(&iph->check);
 
             iph->saddr = new_saddr;
             iph->daddr = new_daddr;
@@ -515,7 +506,7 @@ int tc_relay_func(struct __sk_buff *skb)
     };
 
     struct fwd_val *fval = bpf_map_lookup_elem(&fwd_map, &fkey);
-    struct fwd_val new_fval;
+    struct fwd_val new_fval = {};
 
     if (!fval)
     {
@@ -584,19 +575,18 @@ int tc_relay_func(struct __sk_buff *skb)
 
     __u16 old_l4_csum = *checkp;
 
-    l4_csum_replace16(proto, checkp, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
-    l4_csum_replace16(proto, checkp, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
-    l4_csum_replace16(proto, checkp, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
-    l4_csum_replace16(proto, checkp, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+    if (!(proto == IPPROTO_UDP && old_l4_csum == 0))
+    {
+        update_csum32(checkp, old_saddr, new_saddr);
+        update_csum32(checkp, old_daddr, new_daddr);
+        update_csum(checkp, old_sport, new_sport);
+        update_csum(checkp, old_dport, new_dport);
+        l4_csum_fixup_zero(proto, checkp, old_l4_csum);
+    }
 
-    l4_csum_replace16(proto, checkp, old_sport, new_sport);
-    l4_csum_replace16(proto, checkp, old_dport, new_dport);
-    udp_csum_fixup_zero(proto, checkp, old_l4_csum);
-
-    update_csum(&iph->check, (__u16)(old_saddr & 0xFFFF), (__u16)(new_saddr & 0xFFFF));
-    update_csum(&iph->check, (__u16)(old_saddr >> 16), (__u16)(new_saddr >> 16));
-    update_csum(&iph->check, (__u16)(old_daddr & 0xFFFF), (__u16)(new_daddr & 0xFFFF));
-    update_csum(&iph->check, (__u16)(old_daddr >> 16), (__u16)(new_daddr >> 16));
+    update_csum32(&iph->check, old_saddr, new_saddr);
+    update_csum32(&iph->check, old_daddr, new_daddr);
+    ip_csum_fixup_zero(&iph->check);
 
     iph->saddr = new_saddr;
     iph->daddr = new_daddr;

@@ -42,6 +42,7 @@ type relayRelayRule struct {
 	TargetPort   uint16
 	RelayMac     [6]uint8
 	NextHopMac   [6]uint8
+	Pad          uint16
 	RelayIfindex uint32
 	TxIfindex    uint32
 }
