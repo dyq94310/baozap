@@ -43,6 +43,19 @@ type attachPlan struct {
 
 var version = "dev"
 
+var linkCache = make(map[string]netlink.Link)
+
+func getLink(name string) (netlink.Link, error) {
+	if l, ok := linkCache[name]; ok {
+		return l, nil
+	}
+	l, err := netlink.LinkByName(name)
+	if err == nil {
+		linkCache[name] = l
+	}
+	return l, err
+}
+
 /*
 * 约定
 * go：负责主机序到BPF网络序的转换，负责繁琐工作
@@ -123,15 +136,15 @@ func main() {
 			continue
 		}
 
-		val := buildRelayRuleValue(
-			snatIP,
-			tip,
-			htons(rule.TargetPort), // raw network-order uint16
-			outMAC,
-			nextHopMAC,
-			relayIfindex,
-			txIfindex,
-		)
+		val := relayRelayRule{
+			RelayIp:      snatIP,
+			TargetIp:     tip,
+			TargetPort:   htons(rule.TargetPort),
+			RelayMac:     outMAC,
+			NextHopMac:   nextHopMAC,
+			RelayIfindex: uint32(relayIfindex),
+			TxIfindex:    uint32(txIfindex),
+		}
 
 		portKey := htons(rule.RelayPort)
 		if err := objs.ConfigMap.Update(portKey, val, ebpf.UpdateAny); err != nil {
@@ -202,7 +215,7 @@ func normalizeMode(mode, fallback string) (string, error) {
 }
 
 func planInterfaceMode(plans map[int]*attachPlan, ifName, mode string) {
-	lnk, err := netlink.LinkByName(ifName)
+	lnk, err := getLink(ifName)
 	if err != nil || lnk.Attrs() == nil {
 		return
 	}
@@ -233,11 +246,11 @@ func isVersionFlagRequested() bool {
 }
 
 func probeNetwork(relayIfaceName, targetIfaceName, targetIPStr string) (uint32, [6]byte, [6]byte, int, int, error) {
-	relayLink, err := netlink.LinkByName(relayIfaceName)
+	relayLink, err := getLink(relayIfaceName)
 	if err != nil {
 		return 0, [6]byte{}, [6]byte{}, 0, 0, err
 	}
-	targetLink, err := netlink.LinkByName(targetIfaceName)
+	targetLink, err := getLink(targetIfaceName)
 	if err != nil {
 		return 0, [6]byte{}, [6]byte{}, 0, 0, err
 	}
@@ -310,18 +323,6 @@ func probeNetwork(relayIfaceName, targetIfaceName, targetIPStr string) (uint32, 
 	}
 
 	return snatIP, outMAC, outMAC, relayIfindex, txIfindex, fmt.Errorf("ARP not found for gateway %s on %s", gw, targetIfaceName)
-}
-
-func buildRelayRuleValue(relayIP, targetIP uint32, targetPort uint16, relayMAC, nextHopMAC [6]byte, relayIfindex, txIfindex int) []byte {
-	val := make([]byte, 30)
-	binary.LittleEndian.PutUint32(val[0:4], relayIP)
-	binary.LittleEndian.PutUint32(val[4:8], targetIP)
-	binary.LittleEndian.PutUint16(val[8:10], targetPort)
-	copy(val[10:16], relayMAC[:])
-	copy(val[16:22], nextHopMAC[:])
-	binary.LittleEndian.PutUint32(val[22:26], uint32(relayIfindex))
-	binary.LittleEndian.PutUint32(val[26:30], uint32(txIfindex))
-	return val
 }
 
 func attachXDPWithFallback(prog *ebpf.Program, ifIndex int, ifName string) (io.Closer, string, error) {
