@@ -41,7 +41,7 @@ type attachPlan struct {
 	xdp    bool
 }
 
-var version = "dev"
+var version = "v0.6.1"
 
 var linkCache = make(map[string]netlink.Link)
 
