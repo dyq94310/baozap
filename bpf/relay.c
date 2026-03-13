@@ -22,6 +22,8 @@
 #define IP_DF 0x4000     /* Flag: "Don't Fragment"	*/
 #define IP_MF 0x2000     /* Flag: "More Fragments"	*/
 #define IP_OFFSET 0x1FFF /* "Fragment Offset" part	*/
+#define IPV4_MAX_IHL_BYTES 60u
+#define TC_PULL_LEN (sizeof(struct ethhdr) + IPV4_MAX_IHL_BYTES + sizeof(struct tcphdr))
 
 #define RETURN_PASS()        \
     do                       \
@@ -406,14 +408,19 @@ static inline __attribute__((always_inline)) int tc_redirect_tx(__u32 ifindex)
 
 static inline __attribute__((always_inline)) int tc_prepare_skb(struct __sk_buff *skb)
 {
-    if (bpf_skb_pull_data(skb, skb->len) < 0)
+    /*
+     * GRO/GSO traffic often arrives with payload stored in skb frags.
+     * We only need L2/L3/L4 headers for NAT, so avoid full linearization
+     * of large skbs and keep payload in frags.
+     */
+    if (bpf_skb_pull_data(skb, TC_PULL_LEN) < 0)
         return -1;
     return 0;
 }
 
 static inline __attribute__((always_inline)) int tc_store_bytes(struct __sk_buff *skb, __u32 off, const void *from, __u32 len)
 {
-    return bpf_skb_store_bytes(skb, off, from, len, BPF_F_RECOMPUTE_CSUM);
+    return bpf_skb_store_bytes(skb, off, from, len, BPF_F_INVALIDATE_HASH);
 }
 
 static inline __attribute__((always_inline)) int tc_store_ports(struct __sk_buff *skb, __u32 sport_off, __u16 new_sport,
@@ -422,6 +429,36 @@ static inline __attribute__((always_inline)) int tc_store_ports(struct __sk_buff
     if (tc_store_bytes(skb, sport_off, &new_sport, sizeof(new_sport)) < 0)
         return -1;
     if (tc_store_bytes(skb, dport_off, &new_dport, sizeof(new_dport)) < 0)
+        return -1;
+    return 0;
+}
+
+static inline __attribute__((always_inline)) int tc_update_ip_csum(struct __sk_buff *skb, __u32 ip_check_off,
+                                                                   __u32 old_saddr, __u32 new_saddr,
+                                                                   __u32 old_daddr, __u32 new_daddr)
+{
+    if (bpf_l3_csum_replace(skb, ip_check_off, old_saddr, new_saddr, sizeof(new_saddr)) < 0)
+        return -1;
+    if (bpf_l3_csum_replace(skb, ip_check_off, old_daddr, new_daddr, sizeof(new_daddr)) < 0)
+        return -1;
+    return 0;
+}
+
+static inline __attribute__((always_inline)) int tc_update_l4_csum(struct __sk_buff *skb, __u8 proto, __u32 l4_check_off,
+                                                                   __u16 old_l4_csum, __u32 old_saddr, __u32 new_saddr,
+                                                                   __u32 old_daddr, __u32 new_daddr, __u16 old_sport,
+                                                                   __u16 new_sport, __u16 old_dport, __u16 new_dport)
+{
+    if (proto == IPPROTO_UDP && old_l4_csum == 0)
+        return 0;
+
+    if (bpf_l4_csum_replace(skb, l4_check_off, old_saddr, new_saddr, BPF_F_PSEUDO_HDR | sizeof(new_saddr)) < 0)
+        return -1;
+    if (bpf_l4_csum_replace(skb, l4_check_off, old_daddr, new_daddr, BPF_F_PSEUDO_HDR | sizeof(new_daddr)) < 0)
+        return -1;
+    if (bpf_l4_csum_replace(skb, l4_check_off, old_sport, new_sport, sizeof(new_sport)) < 0)
+        return -1;
+    if (bpf_l4_csum_replace(skb, l4_check_off, old_dport, new_dport, sizeof(new_dport)) < 0)
         return -1;
     return 0;
 }
@@ -485,15 +522,29 @@ int tc_relay_func(struct __sk_buff *skb)
         struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
         if (rval)
         {
+            __u32 old_saddr = iph->saddr;
+            __u32 old_daddr = iph->daddr;
             __u32 new_saddr = rval->vip;
             __u32 new_daddr = rval->client_ip;
+            __u16 old_sport = sport;
+            __u16 old_dport = dport;
             __u16 new_sport = rval->service_port;
             __u16 new_dport = rval->client_port;
             __u32 l3_off = sizeof(*eth);
+            __u32 ip_check_off = l3_off + offsetof(struct iphdr, check);
             __u32 saddr_off = l3_off + offsetof(struct iphdr, saddr);
             __u32 daddr_off = l3_off + offsetof(struct iphdr, daddr);
             __u32 sport_off = l3_off + ihl_bytes;
             __u32 dport_off = sport_off + sizeof(__u16);
+            __u32 l4_check_off = l3_off + ihl_bytes +
+                                 (proto == IPPROTO_TCP ? offsetof(struct tcphdr, check) : offsetof(struct udphdr, check));
+            __u16 old_l4_csum = *checkp;
+
+            if (tc_update_ip_csum(skb, ip_check_off, old_saddr, new_saddr, old_daddr, new_daddr) < 0)
+                RETURN_TC_OK();
+            if (tc_update_l4_csum(skb, proto, l4_check_off, old_l4_csum, old_saddr, new_saddr, old_daddr, new_daddr,
+                                  old_sport, new_sport, old_dport, new_dport) < 0)
+                RETURN_TC_OK();
 
             if (tc_store_bytes(skb, saddr_off, &new_saddr, sizeof(new_saddr)) < 0)
                 RETURN_TC_OK();
@@ -577,15 +628,29 @@ int tc_relay_func(struct __sk_buff *skb)
         }
     }
 
+    __u32 old_saddr = iph->saddr;
+    __u32 old_daddr = iph->daddr;
     __u32 new_saddr = fval->snat_ip;
     __u32 new_daddr = fval->target_ip;
+    __u16 old_sport = sport;
+    __u16 old_dport = dport;
     __u16 new_sport = fval->snat_port;
     __u16 new_dport = fval->target_port;
     __u32 l3_off = sizeof(*eth);
+    __u32 ip_check_off = l3_off + offsetof(struct iphdr, check);
     __u32 saddr_off = l3_off + offsetof(struct iphdr, saddr);
     __u32 daddr_off = l3_off + offsetof(struct iphdr, daddr);
     __u32 sport_off = l3_off + ihl_bytes;
     __u32 dport_off = sport_off + sizeof(__u16);
+    __u32 l4_check_off = l3_off + ihl_bytes +
+                         (proto == IPPROTO_TCP ? offsetof(struct tcphdr, check) : offsetof(struct udphdr, check));
+    __u16 old_l4_csum = *checkp;
+
+    if (tc_update_ip_csum(skb, ip_check_off, old_saddr, new_saddr, old_daddr, new_daddr) < 0)
+        RETURN_TC_OK();
+    if (tc_update_l4_csum(skb, proto, l4_check_off, old_l4_csum, old_saddr, new_saddr, old_daddr, new_daddr,
+                          old_sport, new_sport, old_dport, new_dport) < 0)
+        RETURN_TC_OK();
 
     if (tc_store_bytes(skb, saddr_off, &new_saddr, sizeof(new_saddr)) < 0)
         RETURN_TC_OK();

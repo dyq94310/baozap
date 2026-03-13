@@ -17,10 +17,12 @@ const (
 	xdpTx       = 3
 	tcActOK     = 0
 	tcRedirect  = 7
+	ipProtoTCP  = 6
 	ipProtoUDP  = 17
 	ipProtoICMP = 1
 	ethHdrLen   = 14
 	ipv4HdrLen  = 20
+	tcpHdrLen   = 20
 	udpHdrLen   = 8
 	ipv4EthType = 0x0800
 	snatMinPort = 49152
@@ -47,6 +49,13 @@ func (o *relayObjects) Close() error {
 }
 
 type udpTuple struct {
+	srcIP   string
+	dstIP   string
+	srcPort uint16
+	dstPort uint16
+}
+
+type tcpTuple struct {
 	srcIP   string
 	dstIP   string
 	srcPort uint16
@@ -283,6 +292,119 @@ func TestTCForwardAndReverseRewrite(t *testing.T) {
 	if gotDstPort != clientPort {
 		t.Fatalf("reverse dst port = %d, want %d", gotDstPort, clientPort)
 	}
+}
+
+func TestTCForwardAndReverseRewriteTCPPreservesPayload(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root or CAP_BPF/CAP_SYS_ADMIN")
+	}
+
+	objs := mustLoadRelayObjectsForTest(t)
+	defer objs.Close()
+
+	if objs.TcRelayFunc == nil {
+		t.Skip("tc_relay_func not available in object")
+	}
+
+	relayIP := "10.10.0.1"
+	targetIP := "172.16.8.9"
+	clientIP := "192.168.50.100"
+
+	relayMAC := [6]byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01}
+	nextHopMAC := [6]byte{0x02, 0xde, 0xad, 0xbe, 0xef, 0x10}
+	clientMAC := [6]byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}
+	targetMAC := [6]byte{0x02, 0x66, 0x77, 0x88, 0x99, 0xaa}
+
+	const relayPort = uint16(9999)
+	const targetPort = uint16(11786)
+	const clientPort = uint16(54321)
+
+	payload := bytes.Repeat([]byte("abcd1234"), 256)
+
+	if err := writeRelayRule(objs.ConfigMap, relayPort, relayIP, targetIP, targetPort, relayMAC, nextHopMAC, 0, 0); err != nil {
+		t.Fatalf("write relay rule: %v", err)
+	}
+
+	forwardIn := buildTCPPacket(
+		clientMAC,
+		relayMAC,
+		tcpTuple{
+			srcIP:   clientIP,
+			dstIP:   relayIP,
+			srcPort: clientPort,
+			dstPort: relayPort,
+		},
+		payload,
+	)
+
+	ret, forwardOut, err := objs.TcRelayFunc.Test(forwardIn)
+	if err != nil {
+		t.Fatalf("tc tcp forward test: %v", err)
+	}
+	if ret != tcRedirect {
+		t.Fatalf("forward action = %d, want TC_ACT_REDIRECT(%d)", ret, tcRedirect)
+	}
+
+	gotDstMAC, gotSrcMAC, gotSrcIP, gotDstIP, gotSrcPort, gotDstPort, gotPayload := decodeTCPPacket(t, forwardOut)
+	if !bytes.Equal(gotDstMAC[:], nextHopMAC[:]) {
+		t.Fatalf("forward dst mac = %x, want %x", gotDstMAC, nextHopMAC)
+	}
+	if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
+		t.Fatalf("forward src mac = %x, want %x", gotSrcMAC, relayMAC)
+	}
+	if gotSrcIP.String() != relayIP || gotDstIP.String() != targetIP {
+		t.Fatalf("forward tuple ip = %s -> %s, want %s -> %s", gotSrcIP, gotDstIP, relayIP, targetIP)
+	}
+	if gotDstPort != targetPort {
+		t.Fatalf("forward dst port = %d, want %d", gotDstPort, targetPort)
+	}
+	if gotSrcPort < snatMinPort || gotSrcPort > snatMaxPort {
+		t.Fatalf("snat port out of range: %d", gotSrcPort)
+	}
+	if !bytes.Equal(gotPayload, payload) {
+		t.Fatal("forward payload changed after tc rewrite")
+	}
+	assertIPv4Checksum(t, forwardOut)
+	assertTCPChecksum(t, forwardOut)
+
+	reverseIn := buildTCPPacket(
+		targetMAC,
+		relayMAC,
+		tcpTuple{
+			srcIP:   targetIP,
+			dstIP:   relayIP,
+			srcPort: targetPort,
+			dstPort: gotSrcPort,
+		},
+		payload,
+	)
+
+	ret, reverseOut, err := objs.TcRelayFunc.Test(reverseIn)
+	if err != nil {
+		t.Fatalf("tc tcp reverse test: %v", err)
+	}
+	if ret != tcRedirect {
+		t.Fatalf("reverse action = %d, want TC_ACT_REDIRECT(%d)", ret, tcRedirect)
+	}
+
+	gotDstMAC, gotSrcMAC, gotSrcIP, gotDstIP, gotSrcPort, gotDstPort, gotPayload = decodeTCPPacket(t, reverseOut)
+	if !bytes.Equal(gotDstMAC[:], clientMAC[:]) {
+		t.Fatalf("reverse dst mac = %x, want %x", gotDstMAC, clientMAC)
+	}
+	if !bytes.Equal(gotSrcMAC[:], relayMAC[:]) {
+		t.Fatalf("reverse src mac = %x, want %x", gotSrcMAC, relayMAC)
+	}
+	if gotSrcIP.String() != relayIP || gotDstIP.String() != clientIP {
+		t.Fatalf("reverse tuple ip = %s -> %s, want %s -> %s", gotSrcIP, gotDstIP, relayIP, clientIP)
+	}
+	if gotSrcPort != relayPort || gotDstPort != clientPort {
+		t.Fatalf("reverse tuple port = %d -> %d, want %d -> %d", gotSrcPort, gotDstPort, relayPort, clientPort)
+	}
+	if !bytes.Equal(gotPayload, payload) {
+		t.Fatal("reverse payload changed after tc rewrite")
+	}
+	assertIPv4Checksum(t, reverseOut)
+	assertTCPChecksum(t, reverseOut)
 }
 
 func TestXDPNoRulePass(t *testing.T) {
@@ -599,6 +721,43 @@ func buildIPv4Packet(srcMAC, dstMAC [6]byte, proto uint8, srcIP, dstIP string) [
 	return b
 }
 
+func buildTCPPacket(srcMAC, dstMAC [6]byte, tuple tcpTuple, payload []byte) []byte {
+	b := make([]byte, ethHdrLen+ipv4HdrLen+tcpHdrLen+len(payload))
+	copy(b[0:6], dstMAC[:])
+	copy(b[6:12], srcMAC[:])
+	binary.BigEndian.PutUint16(b[12:14], ipv4EthType)
+
+	ipStart := ethHdrLen
+	b[ipStart+0] = 0x45
+	b[ipStart+1] = 0
+	binary.BigEndian.PutUint16(b[ipStart+2:ipStart+4], uint16(ipv4HdrLen+tcpHdrLen+len(payload)))
+	binary.BigEndian.PutUint16(b[ipStart+4:ipStart+6], 0)
+	binary.BigEndian.PutUint16(b[ipStart+6:ipStart+8], 0)
+	b[ipStart+8] = 64
+	b[ipStart+9] = ipProtoTCP
+
+	srcIP := net.ParseIP(tuple.srcIP).To4()
+	dstIP := net.ParseIP(tuple.dstIP).To4()
+	copy(b[ipStart+12:ipStart+16], srcIP)
+	copy(b[ipStart+16:ipStart+20], dstIP)
+	binary.BigEndian.PutUint16(b[ipStart+10:ipStart+12], ipv4Checksum(b[ipStart:ipStart+ipv4HdrLen]))
+
+	tcpStart := ethHdrLen + ipv4HdrLen
+	binary.BigEndian.PutUint16(b[tcpStart+0:tcpStart+2], tuple.srcPort)
+	binary.BigEndian.PutUint16(b[tcpStart+2:tcpStart+4], tuple.dstPort)
+	binary.BigEndian.PutUint32(b[tcpStart+4:tcpStart+8], 1)
+	binary.BigEndian.PutUint32(b[tcpStart+8:tcpStart+12], 0)
+	b[tcpStart+12] = (tcpHdrLen / 4) << 4
+	b[tcpStart+13] = 0x18
+	binary.BigEndian.PutUint16(b[tcpStart+14:tcpStart+16], 65535)
+	binary.BigEndian.PutUint16(b[tcpStart+16:tcpStart+18], 0)
+	binary.BigEndian.PutUint16(b[tcpStart+18:tcpStart+20], 0)
+	copy(b[tcpStart+tcpHdrLen:], payload)
+	binary.BigEndian.PutUint16(b[tcpStart+16:tcpStart+18], tcpChecksum(srcIP, dstIP, b[tcpStart:]))
+
+	return b
+}
+
 func decodeUDPPacket(t *testing.T, p []byte) (dstMAC, srcMAC [6]byte, srcIP, dstIP net.IP, srcPort, dstPort uint16) {
 	t.Helper()
 	minLen := ethHdrLen + ipv4HdrLen + udpHdrLen
@@ -615,6 +774,57 @@ func decodeUDPPacket(t *testing.T, p []byte) (dstMAC, srcMAC [6]byte, srcIP, dst
 	return
 }
 
+func decodeTCPPacket(t *testing.T, p []byte) (dstMAC, srcMAC [6]byte, srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) {
+	t.Helper()
+	minLen := ethHdrLen + ipv4HdrLen + tcpHdrLen
+	if len(p) < minLen {
+		t.Fatalf("packet too short: %d", len(p))
+	}
+	copy(dstMAC[:], p[0:6])
+	copy(srcMAC[:], p[6:12])
+
+	ipHdrLen := int((p[ethHdrLen] & 0x0f) * 4)
+	tcpStart := ethHdrLen + ipHdrLen
+	if len(p) < tcpStart+tcpHdrLen {
+		t.Fatalf("tcp packet too short: %d", len(p))
+	}
+	tcpDataOff := int((p[tcpStart+12] >> 4) * 4)
+	if len(p) < tcpStart+tcpDataOff {
+		t.Fatalf("tcp data offset beyond packet: %d", tcpDataOff)
+	}
+
+	srcIP = net.IPv4(p[26], p[27], p[28], p[29]).To4()
+	dstIP = net.IPv4(p[30], p[31], p[32], p[33]).To4()
+	srcPort = binary.BigEndian.Uint16(p[tcpStart : tcpStart+2])
+	dstPort = binary.BigEndian.Uint16(p[tcpStart+2 : tcpStart+4])
+	payload = append([]byte(nil), p[tcpStart+tcpDataOff:]...)
+	return
+}
+
+func assertIPv4Checksum(t *testing.T, p []byte) {
+	t.Helper()
+	ipStart := ethHdrLen
+	ipHdrLen := int((p[ipStart] & 0x0f) * 4)
+	got := binary.BigEndian.Uint16(p[ipStart+10 : ipStart+12])
+	want := ipv4Checksum(p[ipStart : ipStart+ipHdrLen])
+	if got != want {
+		t.Fatalf("ipv4 checksum = %#x, want %#x", got, want)
+	}
+}
+
+func assertTCPChecksum(t *testing.T, p []byte) {
+	t.Helper()
+	ipHdrLen := int((p[ethHdrLen] & 0x0f) * 4)
+	tcpStart := ethHdrLen + ipHdrLen
+	srcIP := net.IPv4(p[26], p[27], p[28], p[29]).To4()
+	dstIP := net.IPv4(p[30], p[31], p[32], p[33]).To4()
+	got := binary.BigEndian.Uint16(p[tcpStart+16 : tcpStart+18])
+	want := tcpChecksum(srcIP, dstIP, p[tcpStart:])
+	if got != want {
+		t.Fatalf("tcp checksum = %#x, want %#x", got, want)
+	}
+}
+
 func ipv4Checksum(hdr []byte) uint16 {
 	var sum uint32
 	for i := 0; i < len(hdr); i += 2 {
@@ -622,6 +832,33 @@ func ipv4Checksum(hdr []byte) uint16 {
 			continue
 		}
 		sum += uint32(binary.BigEndian.Uint16(hdr[i : i+2]))
+	}
+	for (sum >> 16) != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func tcpChecksum(srcIP, dstIP net.IP, seg []byte) uint16 {
+	var sum uint32
+
+	srcIP = srcIP.To4()
+	dstIP = dstIP.To4()
+	sum += uint32(binary.BigEndian.Uint16(srcIP[0:2]))
+	sum += uint32(binary.BigEndian.Uint16(srcIP[2:4]))
+	sum += uint32(binary.BigEndian.Uint16(dstIP[0:2]))
+	sum += uint32(binary.BigEndian.Uint16(dstIP[2:4]))
+	sum += uint32(ipProtoTCP)
+	sum += uint32(len(seg))
+
+	for i := 0; i+1 < len(seg); i += 2 {
+		if i == 16 {
+			continue
+		}
+		sum += uint32(binary.BigEndian.Uint16(seg[i : i+2]))
+	}
+	if len(seg)%2 == 1 {
+		sum += uint32(seg[len(seg)-1]) << 8
 	}
 	for (sum >> 16) != 0 {
 		sum = (sum & 0xffff) + (sum >> 16)

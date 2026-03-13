@@ -17,15 +17,19 @@
 2. `-v/--version` 参数识别
 3. XDP 挂载模式错误判定（`isXDPModeUnsupported`）
 
-### XDP 集成测试
+### eBPF 集成测试
 
 正向与反向主链路：
 
 1. `TestXDPForwardAndReverseRewrite`
+2. `TestTCForwardAndReverseRewrite`
+3. `TestTCForwardAndReverseRewriteTCPPreservesPayload`
 2. 关键字段改写正确性：
    - 二层：源/目的 MAC
    - 三层：源/目的 IPv4
-   - 四层：源/目的 UDP 端口
+   - 四层：TCP/UDP 源/目的端口
+   - 校验和：IPv4 / TCP 改写后保持正确
+   - 负载：TC TCP 改写后 payload 不变
 3. SNAT 端口分配范围（`49152..65535`）
 
 反例与异常场景：
@@ -34,6 +38,7 @@
 2. `TestXDPReverseWithoutSessionPass`：无会话反向包时 `XDP_PASS`
 3. `TestXDPFragmentPass`：分片包时 `XDP_PASS`
 4. `TestXDPUnsupportedProtocolPass`：非 TCP/UDP（如 ICMP）时 `XDP_PASS`
+5. `TestTCNoRulePass` / `TestTCReverseWithoutSessionPass` / `TestTCFragmentPass` / `TestTCUnsupportedProtocolPass`
 
 ## 运行方式
 
