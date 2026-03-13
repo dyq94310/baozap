@@ -120,6 +120,7 @@ type relayProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type relayMapSpecs struct {
 	ConfigMap *ebpf.MapSpec `ebpf:"config_map"`
+	DebugMap  *ebpf.MapSpec `ebpf:"debug_map"`
 	FwdMap    *ebpf.MapSpec `ebpf:"fwd_map"`
 	RevMap    *ebpf.MapSpec `ebpf:"rev_map"`
 }
@@ -151,6 +152,7 @@ func (o *relayObjects) Close() error {
 // It can be passed to loadRelayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type relayMaps struct {
 	ConfigMap *ebpf.Map `ebpf:"config_map"`
+	DebugMap  *ebpf.Map `ebpf:"debug_map"`
 	FwdMap    *ebpf.Map `ebpf:"fwd_map"`
 	RevMap    *ebpf.Map `ebpf:"rev_map"`
 }
@@ -158,6 +160,7 @@ type relayMaps struct {
 func (m *relayMaps) Close() error {
 	return _RelayClose(
 		m.ConfigMap,
+		m.DebugMap,
 		m.FwdMap,
 		m.RevMap,
 	)

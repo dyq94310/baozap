@@ -41,7 +41,22 @@ type attachPlan struct {
 	xdp    bool
 }
 
-var version = "v0.6.3"
+var debugCounterNames = []string{
+	"tc_non_ip",
+	"tc_non_ipv4",
+	"tc_unsupported_proto",
+	"tc_fragment",
+	"tc_parse_fail",
+	"tc_reverse_hit",
+	"tc_reverse_miss",
+	"tc_no_rule",
+	"tc_if_mismatch",
+	"tc_forward_new",
+	"tc_forward_reuse",
+	"tc_redirect",
+}
+
+var version = "v0.6.4"
 
 var linkCache = make(map[string]netlink.Link)
 
@@ -101,6 +116,16 @@ func main() {
 	}
 
 	defer objs.Close()
+
+	if conf.Debug {
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				dumpDebugCounters(objs.DebugMap)
+			}
+		}()
+	}
 
 	defaultMode, err := normalizeMode(conf.Mode, "tc")
 	if err != nil {
@@ -196,6 +221,10 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
+
+	if conf.Debug {
+		dumpDebugCounters(objs.DebugMap)
+	}
 }
 
 func normalizeMode(mode, fallback string) (string, error) {
@@ -456,4 +485,21 @@ func isXDPModeUnsupported(err error) bool {
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "operation not supported")
+}
+
+func dumpDebugCounters(m *ebpf.Map) {
+	if m == nil {
+		return
+	}
+
+	fmt.Println("=== debug counters ===")
+	for i, name := range debugCounterNames {
+		key := uint32(i)
+		var val uint64
+		if err := m.Lookup(&key, &val); err != nil {
+			fmt.Printf("%s: lookup failed: %v\n", name, err)
+			continue
+		}
+		fmt.Printf("%s=%d\n", name, val)
+	}
 }

@@ -109,6 +109,35 @@ struct {
 	__type(value, struct rev_val);
 } rev_map SEC(".maps");
 
+enum debug_counter_key {
+	DEBUG_TC_NON_IP = 0,
+	DEBUG_TC_NON_IPV4 = 1,
+	DEBUG_TC_UNSUPPORTED_PROTO = 2,
+	DEBUG_TC_FRAGMENT = 3,
+	DEBUG_TC_PARSE_FAIL = 4,
+	DEBUG_TC_REVERSE_HIT = 5,
+	DEBUG_TC_REVERSE_MISS = 6,
+	DEBUG_TC_NO_RULE = 7,
+	DEBUG_TC_IF_MISMATCH = 8,
+	DEBUG_TC_FORWARD_NEW = 9,
+	DEBUG_TC_FORWARD_REUSE = 10,
+	DEBUG_TC_REDIRECT = 11,
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 16);
+	__type(key, __u32);
+	__type(value, __u64);
+} debug_map SEC(".maps");
+
+static inline __attribute__((always_inline)) void debug_inc(__u32 key)
+{
+    __u64 *val = bpf_map_lookup_elem(&debug_map, &key);
+    if (val)
+        __sync_fetch_and_add(val, 1);
+}
+
 // RFC1624 incremental checksum update
 static inline __attribute__((always_inline)) void update_csum(__u16 *csum, __u16 old_val, __u16 new_val)
 {
@@ -477,21 +506,33 @@ int tc_relay_func(struct __sk_buff *skb)
         RETURN_TC_OK();
 
     if (eth->h_proto != bpf_htons(ETH_P_IP))
+    {
+        debug_inc(DEBUG_TC_NON_IP);
         RETURN_TC_OK();
+    }
 
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         RETURN_TC_OK();
 
     if (iph->version != 4)
+    {
+        debug_inc(DEBUG_TC_NON_IPV4);
         RETURN_TC_OK();
+    }
 
     __u8 proto = iph->protocol;
     if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
+    {
+        debug_inc(DEBUG_TC_UNSUPPORTED_PROTO);
         RETURN_TC_OK();
+    }
 
     if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+    {
+        debug_inc(DEBUG_TC_FRAGMENT);
         RETURN_TC_OK();
+    }
 
     __u32 ihl_bytes = (__u32)iph->ihl * 4;
     if (ihl_bytes < sizeof(*iph))
@@ -503,7 +544,10 @@ int tc_relay_func(struct __sk_buff *skb)
 
     __u16 *sportp = 0, *dportp = 0, *checkp = 0;
     if (parse_l4(l4, data_end, proto, &sportp, &dportp, &checkp) < 0)
+    {
+        debug_inc(DEBUG_TC_PARSE_FAIL);
         RETURN_TC_OK();
+    }
 
     __u16 sport = *sportp;
     __u16 dport = *dportp;
@@ -522,6 +566,7 @@ int tc_relay_func(struct __sk_buff *skb)
         struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
         if (rval)
         {
+            debug_inc(DEBUG_TC_REVERSE_HIT);
             __u32 old_saddr = iph->saddr;
             __u32 old_daddr = iph->daddr;
             __u32 new_saddr = rval->vip;
@@ -558,8 +603,10 @@ int tc_relay_func(struct __sk_buff *skb)
                 RETURN_TC_OK();
 
             __u32 tx_ifindex = rval->client_ifindex ? rval->client_ifindex : skb->ifindex;
+            debug_inc(DEBUG_TC_REDIRECT);
             return tc_redirect_tx(tx_ifindex);
         }
+        debug_inc(DEBUG_TC_REVERSE_MISS);
     }
 
     struct fwd_key fkey = {
@@ -577,10 +624,16 @@ int tc_relay_func(struct __sk_buff *skb)
     {
         struct relay_rule *rule = bpf_map_lookup_elem(&config_map, &dport);
         if (!rule)
+        {
+            debug_inc(DEBUG_TC_NO_RULE);
             RETURN_TC_OK();
+        }
 
         if (rule->relay_ifindex != 0 && rule->relay_ifindex != skb->ifindex)
+        {
+            debug_inc(DEBUG_TC_IF_MISMATCH);
             RETURN_TC_OK();
+        }
 
         struct rev_key new_rkey = {
             .snat_ip = rule->relay_ip,
@@ -624,8 +677,13 @@ int tc_relay_func(struct __sk_buff *skb)
         }
         else
         {
+            debug_inc(DEBUG_TC_FORWARD_NEW);
             fval = &new_fval;
         }
+    }
+    else
+    {
+        debug_inc(DEBUG_TC_FORWARD_REUSE);
     }
 
     __u32 old_saddr = iph->saddr;
@@ -664,6 +722,7 @@ int tc_relay_func(struct __sk_buff *skb)
         RETURN_TC_OK();
 
     __u32 tx_ifindex = fval->tx_ifindex ? fval->tx_ifindex : skb->ifindex;
+    debug_inc(DEBUG_TC_REDIRECT);
     return tc_redirect_tx(tx_ifindex);
 }
 
