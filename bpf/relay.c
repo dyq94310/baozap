@@ -8,6 +8,7 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/in.h>
+#include <linux/if_packet.h>
 #include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -403,9 +404,34 @@ static inline __attribute__((always_inline)) int tc_redirect_tx(__u32 ifindex)
     return bpf_redirect(ifindex, 0);
 }
 
+static inline __attribute__((always_inline)) int tc_prepare_skb(struct __sk_buff *skb)
+{
+    if (bpf_skb_pull_data(skb, skb->len) < 0)
+        return -1;
+    return 0;
+}
+
+static inline __attribute__((always_inline)) int tc_store_bytes(struct __sk_buff *skb, __u32 off, const void *from, __u32 len)
+{
+    return bpf_skb_store_bytes(skb, off, from, len, BPF_F_RECOMPUTE_CSUM);
+}
+
+static inline __attribute__((always_inline)) int tc_store_ports(struct __sk_buff *skb, __u32 sport_off, __u16 new_sport,
+                                                                __u32 dport_off, __u16 new_dport)
+{
+    if (tc_store_bytes(skb, sport_off, &new_sport, sizeof(new_sport)) < 0)
+        return -1;
+    if (tc_store_bytes(skb, dport_off, &new_dport, sizeof(new_dport)) < 0)
+        return -1;
+    return 0;
+}
+
 SEC("classifier")
 int tc_relay_func(struct __sk_buff *skb)
 {
+    if (tc_prepare_skb(skb) < 0)
+        RETURN_TC_OK();
+
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
 
@@ -459,38 +485,26 @@ int tc_relay_func(struct __sk_buff *skb)
         struct rev_val *rval = bpf_map_lookup_elem(&rev_map, &rkey);
         if (rval)
         {
-            __u32 old_saddr = iph->saddr;
-            __u32 old_daddr = iph->daddr;
             __u32 new_saddr = rval->vip;
             __u32 new_daddr = rval->client_ip;
-
-            __u16 old_sport = sport;
-            __u16 old_dport = dport;
             __u16 new_sport = rval->service_port;
             __u16 new_dport = rval->client_port;
+            __u32 l3_off = sizeof(*eth);
+            __u32 saddr_off = l3_off + offsetof(struct iphdr, saddr);
+            __u32 daddr_off = l3_off + offsetof(struct iphdr, daddr);
+            __u32 sport_off = l3_off + ihl_bytes;
+            __u32 dport_off = sport_off + sizeof(__u16);
 
-            __u16 old_l4_csum = *checkp;
-
-            if (!(proto == IPPROTO_UDP && old_l4_csum == 0))
-            {
-                update_csum32(checkp, old_saddr, new_saddr);
-                update_csum32(checkp, old_daddr, new_daddr);
-                update_csum(checkp, old_sport, new_sport);
-                update_csum(checkp, old_dport, new_dport);
-                l4_csum_fixup_zero(proto, checkp, old_l4_csum);
-            }
-
-            update_csum32(&iph->check, old_saddr, new_saddr);
-            update_csum32(&iph->check, old_daddr, new_daddr);
-            ip_csum_fixup_zero(&iph->check);
-
-            iph->saddr = new_saddr;
-            iph->daddr = new_daddr;
-            *sportp = new_sport;
-            *dportp = new_dport;
-
-            __builtin_memcpy(eth->h_dest, rval->client_mac, 6);
-            __builtin_memcpy(eth->h_source, rval->relay_mac, 6);
+            if (tc_store_bytes(skb, saddr_off, &new_saddr, sizeof(new_saddr)) < 0)
+                RETURN_TC_OK();
+            if (tc_store_bytes(skb, daddr_off, &new_daddr, sizeof(new_daddr)) < 0)
+                RETURN_TC_OK();
+            if (tc_store_ports(skb, sport_off, new_sport, dport_off, new_dport) < 0)
+                RETURN_TC_OK();
+            if (tc_store_bytes(skb, offsetof(struct ethhdr, h_dest), rval->client_mac, 6) < 0)
+                RETURN_TC_OK();
+            if (tc_store_bytes(skb, offsetof(struct ethhdr, h_source), rval->relay_mac, 6) < 0)
+                RETURN_TC_OK();
 
             __u32 tx_ifindex = rval->client_ifindex ? rval->client_ifindex : skb->ifindex;
             return tc_redirect_tx(tx_ifindex);
@@ -563,38 +577,26 @@ int tc_relay_func(struct __sk_buff *skb)
         }
     }
 
-    __u32 old_saddr = iph->saddr;
-    __u32 old_daddr = iph->daddr;
     __u32 new_saddr = fval->snat_ip;
     __u32 new_daddr = fval->target_ip;
-
-    __u16 old_sport = sport;
-    __u16 old_dport = dport;
     __u16 new_sport = fval->snat_port;
     __u16 new_dport = fval->target_port;
+    __u32 l3_off = sizeof(*eth);
+    __u32 saddr_off = l3_off + offsetof(struct iphdr, saddr);
+    __u32 daddr_off = l3_off + offsetof(struct iphdr, daddr);
+    __u32 sport_off = l3_off + ihl_bytes;
+    __u32 dport_off = sport_off + sizeof(__u16);
 
-    __u16 old_l4_csum = *checkp;
-
-    if (!(proto == IPPROTO_UDP && old_l4_csum == 0))
-    {
-        update_csum32(checkp, old_saddr, new_saddr);
-        update_csum32(checkp, old_daddr, new_daddr);
-        update_csum(checkp, old_sport, new_sport);
-        update_csum(checkp, old_dport, new_dport);
-        l4_csum_fixup_zero(proto, checkp, old_l4_csum);
-    }
-
-    update_csum32(&iph->check, old_saddr, new_saddr);
-    update_csum32(&iph->check, old_daddr, new_daddr);
-    ip_csum_fixup_zero(&iph->check);
-
-    iph->saddr = new_saddr;
-    iph->daddr = new_daddr;
-    *sportp = new_sport;
-    *dportp = new_dport;
-
-    __builtin_memcpy(eth->h_dest, fval->next_hop_mac, 6);
-    __builtin_memcpy(eth->h_source, fval->relay_mac, 6);
+    if (tc_store_bytes(skb, saddr_off, &new_saddr, sizeof(new_saddr)) < 0)
+        RETURN_TC_OK();
+    if (tc_store_bytes(skb, daddr_off, &new_daddr, sizeof(new_daddr)) < 0)
+        RETURN_TC_OK();
+    if (tc_store_ports(skb, sport_off, new_sport, dport_off, new_dport) < 0)
+        RETURN_TC_OK();
+    if (tc_store_bytes(skb, offsetof(struct ethhdr, h_dest), fval->next_hop_mac, 6) < 0)
+        RETURN_TC_OK();
+    if (tc_store_bytes(skb, offsetof(struct ethhdr, h_source), fval->relay_mac, 6) < 0)
+        RETURN_TC_OK();
 
     __u32 tx_ifindex = fval->tx_ifindex ? fval->tx_ifindex : skb->ifindex;
     return tc_redirect_tx(tx_ifindex);

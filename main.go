@@ -41,7 +41,7 @@ type attachPlan struct {
 	xdp    bool
 }
 
-var version = "v0.6.1"
+var version = "v0.6.2"
 
 var linkCache = make(map[string]netlink.Link)
 
@@ -250,21 +250,19 @@ func probeNetwork(relayIfaceName, targetIfaceName, targetIPStr string) (uint32, 
 	if err != nil {
 		return 0, [6]byte{}, [6]byte{}, 0, 0, err
 	}
-	targetLink, err := getLink(targetIfaceName)
+	configTargetLink, err := getLink(targetIfaceName)
 	if err != nil {
 		return 0, [6]byte{}, [6]byte{}, 0, 0, err
 	}
-	if relayLink.Attrs() == nil || targetLink.Attrs() == nil {
+	if relayLink.Attrs() == nil || configTargetLink.Attrs() == nil {
 		return 0, [6]byte{}, [6]byte{}, 0, 0, fmt.Errorf("invalid interface attrs for %s/%s", relayIfaceName, targetIfaceName)
 	}
 
+	targetLink := configTargetLink
 	targetAddrs, err := netlink.AddrList(targetLink, netlink.FAMILY_V4)
 	if err != nil || len(targetAddrs) == 0 {
 		return 0, [6]byte{}, [6]byte{}, 0, 0, fmt.Errorf("no ipv4 addr on target interface %s", targetIfaceName)
 	}
-
-	var outMAC, nextHopMAC [6]byte
-	copy(outMAC[:], targetLink.Attrs().HardwareAddr)
 
 	snatIPv4 := targetAddrs[0].IP.To4()
 	if snatIPv4 == nil {
@@ -276,12 +274,27 @@ func probeNetwork(relayIfaceName, targetIfaceName, targetIPStr string) (uint32, 
 
 	routes, err := netlink.RouteGet(net.ParseIP(targetIPStr))
 	if err != nil || len(routes) == 0 {
-		return 0, outMAC, nextHopMAC, relayIfindex, txIfindex, fmt.Errorf("no route to %s", targetIPStr)
+		return 0, [6]byte{}, [6]byte{}, relayIfindex, txIfindex, fmt.Errorf("no route to %s", targetIPStr)
 	}
 	if routes[0].LinkIndex != 0 {
 		txIfindex = routes[0].LinkIndex
 	}
 	if routes[0].LinkIndex != 0 && routes[0].LinkIndex != targetLink.Attrs().Index {
+		routeLink, err := netlink.LinkByIndex(routes[0].LinkIndex)
+		if err != nil || routeLink.Attrs() == nil {
+			return 0, [6]byte{}, [6]byte{}, relayIfindex, txIfindex, fmt.Errorf("route link for %s ifindex=%d: %w", targetIPStr, routes[0].LinkIndex, err)
+		}
+		targetLink = routeLink
+		targetAddrs, err = netlink.AddrList(targetLink, netlink.FAMILY_V4)
+		if err != nil || len(targetAddrs) == 0 {
+			return 0, [6]byte{}, [6]byte{}, relayIfindex, txIfindex, fmt.Errorf("no ipv4 addr on routed interface %s", targetLink.Attrs().Name)
+		}
+		snatIPv4 = targetAddrs[0].IP.To4()
+		if snatIPv4 == nil {
+			return 0, [6]byte{}, [6]byte{}, relayIfindex, txIfindex, fmt.Errorf("invalid local ipv4 on routed interface %s", targetLink.Attrs().Name)
+		}
+		snatIP = binary.LittleEndian.Uint32(snatIPv4)
+
 		if routeIf, err := netlink.LinkByIndex(routes[0].LinkIndex); err == nil && routeIf.Attrs() != nil {
 			fmt.Printf(
 				"⚠️ Route mismatch: target %s route uses %s, configured target_interface is %s\n",
@@ -294,6 +307,9 @@ func probeNetwork(relayIfaceName, targetIfaceName, targetIPStr string) (uint32, 
 			)
 		}
 	}
+
+	var outMAC, nextHopMAC [6]byte
+	copy(outMAC[:], targetLink.Attrs().HardwareAddr)
 
 	gw := routes[0].Gw
 	if gw == nil {
