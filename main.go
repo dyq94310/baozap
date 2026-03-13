@@ -54,9 +54,15 @@ var debugCounterNames = []string{
 	"tc_forward_new",
 	"tc_forward_reuse",
 	"tc_redirect",
+	"tc_last_no_rule_dport",
+	"tc_last_no_rule_ifindex",
+	"tc_last_no_rule_daddr",
+	"tc_last_reverse_miss_dport",
+	"tc_last_reverse_miss_ifindex",
+	"tc_last_reverse_miss_daddr",
 }
 
-var version = "v0.6.4"
+var version = "v0.6.5"
 
 var linkCache = make(map[string]netlink.Link)
 
@@ -500,6 +506,16 @@ func dumpDebugCounters(m *ebpf.Map) {
 			fmt.Printf("%s: lookup failed: %v\n", name, err)
 			continue
 		}
+		if strings.HasSuffix(name, "_daddr") {
+			fmt.Printf("%s=%s\n", name, rawIPv4String(uint32(val)))
+			continue
+		}
 		fmt.Printf("%s=%d\n", name, val)
 	}
+}
+
+func rawIPv4String(v uint32) string {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	return net.IPv4(b[0], b[1], b[2], b[3]).String()
 }

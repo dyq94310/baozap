@@ -122,11 +122,17 @@ enum debug_counter_key {
 	DEBUG_TC_FORWARD_NEW = 9,
 	DEBUG_TC_FORWARD_REUSE = 10,
 	DEBUG_TC_REDIRECT = 11,
+	DEBUG_TC_LAST_NO_RULE_DPORT = 12,
+	DEBUG_TC_LAST_NO_RULE_IFINDEX = 13,
+	DEBUG_TC_LAST_NO_RULE_DADDR = 14,
+	DEBUG_TC_LAST_REVERSE_MISS_DPORT = 15,
+	DEBUG_TC_LAST_REVERSE_MISS_IFINDEX = 16,
+	DEBUG_TC_LAST_REVERSE_MISS_DADDR = 17,
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 16);
+	__uint(max_entries, 32);
 	__type(key, __u32);
 	__type(value, __u64);
 } debug_map SEC(".maps");
@@ -136,6 +142,11 @@ static inline __attribute__((always_inline)) void debug_inc(__u32 key)
     __u64 *val = bpf_map_lookup_elem(&debug_map, &key);
     if (val)
         __sync_fetch_and_add(val, 1);
+}
+
+static inline __attribute__((always_inline)) void debug_set(__u32 key, __u64 value)
+{
+    bpf_map_update_elem(&debug_map, &key, &value, BPF_ANY);
 }
 
 // RFC1624 incremental checksum update
@@ -607,6 +618,9 @@ int tc_relay_func(struct __sk_buff *skb)
             return tc_redirect_tx(tx_ifindex);
         }
         debug_inc(DEBUG_TC_REVERSE_MISS);
+        debug_set(DEBUG_TC_LAST_REVERSE_MISS_DPORT, dport_host);
+        debug_set(DEBUG_TC_LAST_REVERSE_MISS_IFINDEX, skb->ifindex);
+        debug_set(DEBUG_TC_LAST_REVERSE_MISS_DADDR, iph->daddr);
     }
 
     struct fwd_key fkey = {
@@ -626,6 +640,9 @@ int tc_relay_func(struct __sk_buff *skb)
         if (!rule)
         {
             debug_inc(DEBUG_TC_NO_RULE);
+            debug_set(DEBUG_TC_LAST_NO_RULE_DPORT, dport_host);
+            debug_set(DEBUG_TC_LAST_NO_RULE_IFINDEX, skb->ifindex);
+            debug_set(DEBUG_TC_LAST_NO_RULE_DADDR, iph->daddr);
             RETURN_TC_OK();
         }
 
